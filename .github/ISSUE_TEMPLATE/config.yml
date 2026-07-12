@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/Chuyu03/TinyHwBar/security/advisories/new
+    about: 请私密报告安全漏洞，不要公开披露利用细节。

@@ -1,0 +1,15 @@
+# Generated application and local release staging
+/outputs/
+/release/
+
+# Visual Studio and compiler artifacts
+/.vs/
+/bin/
+/obj/
+*.pdb
+*.suo
+*.user
+
+# Windows shell metadata
+Thumbs.db
+Desktop.ini

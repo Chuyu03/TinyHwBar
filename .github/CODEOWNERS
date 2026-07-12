@@ -1,0 +1,7 @@
+# Security-sensitive project surfaces
+/.github/workflows/ @Chuyu03
+/build.cmd @Chuyu03
+/app.manifest @Chuyu03
+/src/NativeMethods.cs @Chuyu03
+/src/HardwareSampler.cs @Chuyu03
+/SECURITY.md @Chuyu03
