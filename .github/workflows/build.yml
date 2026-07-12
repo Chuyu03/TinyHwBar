@@ -1,0 +1,49 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 build
+    runs-on: windows-2022
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build with .NET Framework compiler
+        shell: cmd
+        run: call build.cmd
+
+      - name: Verify executable metadata
+        shell: powershell
+        run: |
+          $path = Join-Path $env:GITHUB_WORKSPACE 'outputs\TinyHwBar.exe'
+          if (-not (Test-Path -LiteralPath $path)) {
+              throw 'build.cmd did not create outputs\TinyHwBar.exe.'
+          }
+
+          $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+          if ($version.FileVersion -ne '1.0.0.0') {
+              throw "Unexpected file version: $($version.FileVersion)"
+          }
+
+          if ($version.ProductVersion -ne '1.0.0') {
+              throw "Unexpected product version: $($version.ProductVersion)"
+          }
