@@ -12,7 +12,11 @@ TinyHwBar 是一个面向 Windows 11 的单行硬件监控条。它只显示 CPU
 
 从 [GitHub Releases](https://github.com/Chuyu03/TinyHwBar/releases/latest) 下载最新的 `TinyHwBar-v*-win-x64.zip`，解压后运行 `TinyHwBar.exe`。
 
-发布的 EXE 是本项目源码使用 Windows 自带 .NET Framework 编译器生成的未签名程序。请核对 Release 中的 `SHA256SUMS.txt`，并保留 Microsoft Defender 保护。
+发布的 EXE 是本项目源码使用 Windows 自带 .NET Framework 编译器生成的未签名程序。Windows 11 的 [Smart App Control](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/smart-app-control-frequently-asked-questions) 可能直接阻止未知的未签名 EXE，且不提供单应用放行。请勿为了运行 TinyHwBar 关闭 SAC、Microsoft Defender 或添加安全排除项；若被阻止，请保留系统保护并暂不运行此版本。
+
+> **Windows security note:** The v1.0.0 EXE is unsigned and may be blocked by Windows Smart App Control. Do not disable SAC, Microsoft Defender, or add security exclusions to run it.
+
+下载后请核对 Release 中的 `SHA256SUMS.txt`，并保留 Microsoft Defender 保护。
 
 ## 显示内容
 
@@ -113,12 +117,3 @@ Get-FileHash .\outputs\TinyHwBar.exe -Algorithm SHA256
 ## 贡献与许可证
 
 提交改进前请阅读 [CONTRIBUTING.md](https://github.com/Chuyu03/TinyHwBar/blob/main/CONTRIBUTING.md)。TinyHwBar 使用 [MIT License](LICENSE) 发布。
-
-## 第一版不包含
-
-- 网络速度、延迟或带宽检测。
-- Intel 核显数据。
-- 历史记录和曲线图。
-- 设置窗口。
-- 开机启动、安装器或自动更新。
-- 远程接口、遥测或日志上传。
