@@ -20,7 +20,7 @@ namespace TinyHwBar
         internal const int WmDpiChanged = 0x02E0;
         internal const int WmDisplayChange = 0x007E;
 
-        private const string NvmlPath = @"C:\Windows\System32\nvml.dll";
+        private const string NvmlPath = "nvml.dll";
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct FileTime
@@ -124,18 +124,23 @@ namespace TinyHwBar
             int height,
             uint flags);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlInit_v2", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlInitV2();
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlShutdown", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlShutdown();
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlDeviceGetCount_v2", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlDeviceGetCountV2(out uint deviceCount);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlDeviceGetHandleByIndex_v2", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlDeviceGetHandleByIndexV2(uint index, out IntPtr device);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(
             NvmlPath,
             EntryPoint = "nvmlDeviceGetName",
@@ -143,14 +148,17 @@ namespace TinyHwBar
             CharSet = CharSet.Ansi)]
         internal static extern int NvmlDeviceGetName(IntPtr device, StringBuilder name, uint length);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlDeviceGetUtilizationRates", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlDeviceGetUtilizationRates(
             IntPtr device,
             out NvmlUtilization utilization);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlDeviceGetMemoryInfo_v2", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlDeviceGetMemoryInfoV2(IntPtr device, ref NvmlMemoryV2 memory);
 
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport(NvmlPath, EntryPoint = "nvmlDeviceGetTemperature", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int NvmlDeviceGetTemperature(
             IntPtr device,

@@ -41,9 +41,10 @@ CPU 5% · RAM 34% · GPU ECO · VR -- · --°
 - Windows 11 64 位。
 - .NET Framework 4.8。
 - `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`。
-- NVIDIA 驱动提供的 `C:\Windows\System32\nvml.dll`。
+- NVIDIA 驱动提供的 `%WINDIR%\System32\nvml.dll`。
 
 本项目不需要 .NET SDK、MSBuild、NuGet、第三方包、自带驱动或其他下载。
+TinyHwBar 不随附 NVIDIA 驱动；请仅通过设备制造商或 NVIDIA 官方渠道使用仍受支持且包含当前安全更新的驱动。
 
 ## 构建与运行
 
