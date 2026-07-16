@@ -1,7 +1,27 @@
 # Security-sensitive project surfaces
+/.github/CODEOWNERS @Chuyu03
+/.github/ISSUE_TEMPLATE/ @Chuyu03
+/.github/PULL_REQUEST_TEMPLATE.md @Chuyu03
 /.github/workflows/ @Chuyu03
 /build.cmd @Chuyu03
+/test.cmd @Chuyu03
 /app.manifest @Chuyu03
 /src/NativeMethods.cs @Chuyu03
 /src/HardwareSampler.cs @Chuyu03
+/src/IntelGpuSampler.cs @Chuyu03
+/src/NetworkSampler.cs @Chuyu03
+/src/GatewayLatencySampler.cs @Chuyu03
+/src/HistoryStore.cs @Chuyu03
+/src/SettingsStore.cs @Chuyu03
+/src/StartupManager.cs @Chuyu03
+/src/Program.cs @Chuyu03
+/src/UpdateService.cs @Chuyu03
+/src/UpdatePackageService.cs @Chuyu03
+/src/LoopbackApiServer.cs @Chuyu03
+/src/TelemetryService.cs @Chuyu03
+/src/DashboardForm.cs @Chuyu03
+/src/MonitorForm.cs @Chuyu03
+/tests/ @Chuyu03
+/tools/Install-TinyHwBar.ps1 @Chuyu03
+/tools/Uninstall-TinyHwBar.ps1 @Chuyu03
 /SECURITY.md @Chuyu03

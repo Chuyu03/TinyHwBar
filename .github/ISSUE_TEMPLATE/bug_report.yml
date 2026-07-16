@@ -12,8 +12,8 @@ body:
     id: version
     attributes:
       label: TinyHwBar version
-      description: 例如 v1.0.0。
-      placeholder: v1.0.0
+      description: 例如 2.0.0。
+      placeholder: 2.0.0
     validations:
       required: true
   - type: input
@@ -27,8 +27,8 @@ body:
   - type: input
     id: gpu
     attributes:
-      label: NVIDIA GPU and driver
-      description: 如问题与 GPU 无关，可填写 Not applicable。
+      label: GPU model, role, and driver
+      description: 请注明厂商、型号、独显或核显及驱动版本；如问题与 GPU 无关，可填写 Not applicable。
     validations:
       required: true
   - type: dropdown
