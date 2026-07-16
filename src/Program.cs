@@ -15,6 +15,11 @@ namespace TinyHwBar
             {
                 if (!createdNew)
                 {
+                    MessageBox.Show(
+                        "TinyHwBar 已在运行。请先从系统托盘菜单选择“退出”，再启动新版本。",
+                        "TinyHwBar",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
                     return;
                 }
 

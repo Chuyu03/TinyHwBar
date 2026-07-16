@@ -8,11 +8,31 @@ namespace TinyHwBar
 {
     internal sealed class AppSettings
     {
+        internal const int DefaultOpacityPercent = 90;
+        internal static readonly int[] SupportedOpacityPercentages =
+        {
+            50,
+            60,
+            70,
+            80,
+            90,
+            100
+        };
+
         internal bool HasSavedPosition { get; set; }
         internal int Left { get; set; }
         internal int Top { get; set; }
         internal bool Locked { get; set; }
         internal bool ClickThrough { get; set; }
+        internal int OpacityPercent { get; set; }
+        internal bool PersistHistory { get; set; }
+        internal bool GatewayLatencyEnabled { get; set; }
+        internal bool StartupEnabled { get; set; }
+        internal bool AutomaticUpdateEnabled { get; set; }
+        internal string UpdateManifestUrl { get; set; }
+        internal bool LoopbackApiEnabled { get; set; }
+        internal bool TelemetryEnabled { get; set; }
+        internal string TelemetryEndpoint { get; set; }
 
         internal static AppSettings CreateDefault()
         {
@@ -22,7 +42,42 @@ namespace TinyHwBar
                 Left = 0,
                 Top = 0,
                 Locked = false,
-                ClickThrough = false
+                ClickThrough = false,
+                OpacityPercent = DefaultOpacityPercent,
+                PersistHistory = true,
+                GatewayLatencyEnabled = true,
+                StartupEnabled = false,
+                AutomaticUpdateEnabled = false,
+                UpdateManifestUrl = string.Empty,
+                LoopbackApiEnabled = false,
+                TelemetryEnabled = false,
+                TelemetryEndpoint = string.Empty
+            };
+        }
+
+        internal static bool IsSupportedOpacityPercent(int value)
+        {
+            return Array.IndexOf(SupportedOpacityPercentages, value) >= 0;
+        }
+
+        internal AppSettings Clone()
+        {
+            return new AppSettings
+            {
+                HasSavedPosition = HasSavedPosition,
+                Left = Left,
+                Top = Top,
+                Locked = Locked,
+                ClickThrough = ClickThrough,
+                OpacityPercent = OpacityPercent,
+                PersistHistory = PersistHistory,
+                GatewayLatencyEnabled = GatewayLatencyEnabled,
+                StartupEnabled = StartupEnabled,
+                AutomaticUpdateEnabled = AutomaticUpdateEnabled,
+                UpdateManifestUrl = UpdateManifestUrl ?? string.Empty,
+                LoopbackApiEnabled = LoopbackApiEnabled,
+                TelemetryEnabled = TelemetryEnabled,
+                TelemetryEndpoint = TelemetryEndpoint ?? string.Empty
             };
         }
     }
@@ -39,7 +94,12 @@ namespace TinyHwBar
 
         internal static AppSettings Load()
         {
-            if (!File.Exists(SettingsPath))
+            return Load(SettingsPath);
+        }
+
+        internal static AppSettings Load(string settingsPath)
+        {
+            if (string.IsNullOrWhiteSpace(settingsPath) || !File.Exists(settingsPath))
             {
                 return AppSettings.CreateDefault();
             }
@@ -49,7 +109,7 @@ namespace TinyHwBar
                 Dictionary<string, string> values = new Dictionary<string, string>(
                     StringComparer.OrdinalIgnoreCase);
 
-                string[] lines = File.ReadAllLines(SettingsPath, Encoding.UTF8);
+                string[] lines = File.ReadAllLines(settingsPath, Encoding.UTF8);
                 foreach (string rawLine in lines)
                 {
                     string line = rawLine.Trim();
@@ -84,6 +144,8 @@ namespace TinyHwBar
                 int top;
                 bool locked;
                 bool clickThrough;
+                int opacityPercent = AppSettings.DefaultOpacityPercent;
+                AppSettings defaults = AppSettings.CreateDefault();
 
                 if (!values.TryGetValue("Version", out versionText) ||
                     !values.TryGetValue("Left", out leftText) ||
@@ -91,7 +153,7 @@ namespace TinyHwBar
                     !values.TryGetValue("Locked", out lockedText) ||
                     !values.TryGetValue("ClickThrough", out clickThroughText) ||
                     !int.TryParse(versionText, NumberStyles.Integer, CultureInfo.InvariantCulture, out version) ||
-                    version != 1 ||
+                    (version != 1 && version != 2) ||
                     !int.TryParse(leftText, NumberStyles.Integer, CultureInfo.InvariantCulture, out left) ||
                     !int.TryParse(topText, NumberStyles.Integer, CultureInfo.InvariantCulture, out top) ||
                     !bool.TryParse(lockedText, out locked) ||
@@ -100,13 +162,88 @@ namespace TinyHwBar
                     return AppSettings.CreateDefault();
                 }
 
+                string opacityPercentText;
+                if (values.TryGetValue("OpacityPercent", out opacityPercentText) &&
+                    (!int.TryParse(
+                        opacityPercentText,
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out opacityPercent) ||
+                     !AppSettings.IsSupportedOpacityPercent(opacityPercent)))
+                {
+                    opacityPercent = AppSettings.DefaultOpacityPercent;
+                }
+
+                bool isVersion2 = version == 2;
+                bool persistHistory = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "PersistHistory",
+                        defaults.PersistHistory)
+                    : defaults.PersistHistory;
+                bool gatewayLatencyEnabled = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "GatewayLatencyEnabled",
+                        defaults.GatewayLatencyEnabled)
+                    : defaults.GatewayLatencyEnabled;
+                bool startupEnabled = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "StartupEnabled",
+                        defaults.StartupEnabled)
+                    : defaults.StartupEnabled;
+                bool automaticUpdateEnabled = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "AutomaticUpdateEnabled",
+                        defaults.AutomaticUpdateEnabled)
+                    : defaults.AutomaticUpdateEnabled;
+                bool loopbackApiEnabled = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "LoopbackApiEnabled",
+                        defaults.LoopbackApiEnabled)
+                    : defaults.LoopbackApiEnabled;
+                bool telemetryEnabled = isVersion2
+                    ? ReadOptionalBoolean(
+                        values,
+                        "TelemetryEnabled",
+                        defaults.TelemetryEnabled)
+                    : defaults.TelemetryEnabled;
+                string updateManifestUrl = isVersion2
+                    ? ReadOptionalHttpsEndpoint(values, "UpdateManifestUrl")
+                    : string.Empty;
+                string telemetryEndpoint = isVersion2
+                    ? ReadOptionalHttpsEndpoint(values, "TelemetryEndpoint")
+                    : string.Empty;
+
+                if (automaticUpdateEnabled && updateManifestUrl.Length == 0)
+                {
+                    automaticUpdateEnabled = false;
+                }
+
+                if (telemetryEnabled && telemetryEndpoint.Length == 0)
+                {
+                    telemetryEnabled = false;
+                }
+
                 return new AppSettings
                 {
                     HasSavedPosition = true,
                     Left = left,
                     Top = top,
                     Locked = locked,
-                    ClickThrough = clickThrough
+                    ClickThrough = clickThrough,
+                    OpacityPercent = opacityPercent,
+                    PersistHistory = persistHistory,
+                    GatewayLatencyEnabled = gatewayLatencyEnabled,
+                    StartupEnabled = startupEnabled,
+                    AutomaticUpdateEnabled = automaticUpdateEnabled,
+                    UpdateManifestUrl = updateManifestUrl,
+                    LoopbackApiEnabled = loopbackApiEnabled,
+                    TelemetryEnabled = telemetryEnabled,
+                    TelemetryEndpoint = telemetryEndpoint
                 };
             }
             catch (Exception)
@@ -115,26 +252,151 @@ namespace TinyHwBar
             }
         }
 
-        internal static void Save(int left, int top, bool locked, bool clickThrough)
+        internal static bool Save(
+            int left,
+            int top,
+            bool locked,
+            bool clickThrough,
+            int opacityPercent)
         {
+            AppSettings settings = AppSettings.CreateDefault();
+            settings.HasSavedPosition = true;
+            settings.Left = left;
+            settings.Top = top;
+            settings.Locked = locked;
+            settings.ClickThrough = clickThrough;
+            settings.OpacityPercent = opacityPercent;
+            return Save(settings);
+        }
+
+        internal static bool Save(AppSettings settings)
+        {
+            return Save(settings, SettingsPath);
+        }
+
+        internal static bool Save(AppSettings settings, string settingsPath)
+        {
+            if (settings == null)
+            {
+                return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(settingsPath))
+            {
+                return false;
+            }
+
             try
             {
-                Directory.CreateDirectory(SettingsDirectory);
+                string directory = Path.GetDirectoryName(settingsPath);
+                if (string.IsNullOrWhiteSpace(directory))
+                {
+                    return false;
+                }
+
+                Directory.CreateDirectory(directory);
 
                 string[] lines =
                 {
-                    "Version=1",
-                    "Left=" + left.ToString(CultureInfo.InvariantCulture),
-                    "Top=" + top.ToString(CultureInfo.InvariantCulture),
-                    "Locked=" + locked.ToString(CultureInfo.InvariantCulture),
-                    "ClickThrough=" + clickThrough.ToString(CultureInfo.InvariantCulture)
+                    "Version=2",
+                    "Left=" + settings.Left.ToString(CultureInfo.InvariantCulture),
+                    "Top=" + settings.Top.ToString(CultureInfo.InvariantCulture),
+                    "Locked=" + settings.Locked.ToString(CultureInfo.InvariantCulture),
+                    "ClickThrough=" + settings.ClickThrough.ToString(CultureInfo.InvariantCulture),
+                    "OpacityPercent=" + settings.OpacityPercent.ToString(CultureInfo.InvariantCulture),
+                    "PersistHistory=" + settings.PersistHistory.ToString(CultureInfo.InvariantCulture),
+                    "GatewayLatencyEnabled=" + settings.GatewayLatencyEnabled.ToString(CultureInfo.InvariantCulture),
+                    "StartupEnabled=" + settings.StartupEnabled.ToString(CultureInfo.InvariantCulture),
+                    "AutomaticUpdateEnabled=" + settings.AutomaticUpdateEnabled.ToString(CultureInfo.InvariantCulture),
+                    "UpdateManifestUrl=" + NormalizeHttpsEndpoint(settings.UpdateManifestUrl),
+                    "LoopbackApiEnabled=" + settings.LoopbackApiEnabled.ToString(CultureInfo.InvariantCulture),
+                    "TelemetryEnabled=" + settings.TelemetryEnabled.ToString(CultureInfo.InvariantCulture),
+                    "TelemetryEndpoint=" + NormalizeHttpsEndpoint(settings.TelemetryEndpoint)
                 };
 
-                File.WriteAllLines(SettingsPath, lines, new UTF8Encoding(false));
+                string temporaryPath = settingsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                string backupPath = settingsPath + ".bak";
+
+                try
+                {
+                    File.WriteAllLines(temporaryPath, lines, new UTF8Encoding(false));
+
+                    if (File.Exists(settingsPath))
+                    {
+                        TryDelete(backupPath);
+                        File.Replace(temporaryPath, settingsPath, backupPath, true);
+                        TryDelete(backupPath);
+                    }
+                    else
+                    {
+                        File.Move(temporaryPath, settingsPath);
+                    }
+
+                    return true;
+                }
+                finally
+                {
+                    TryDelete(temporaryPath);
+                }
             }
             catch (Exception)
             {
                 // Settings persistence is optional; monitoring must continue.
+                return false;
+            }
+        }
+
+        private static bool ReadOptionalBoolean(
+            Dictionary<string, string> values,
+            string key,
+            bool defaultValue)
+        {
+            string text;
+            bool value;
+            return values.TryGetValue(key, out text) && bool.TryParse(text, out value)
+                ? value
+                : defaultValue;
+        }
+
+        private static string ReadOptionalHttpsEndpoint(
+            Dictionary<string, string> values,
+            string key)
+        {
+            string text;
+            return values.TryGetValue(key, out text)
+                ? NormalizeHttpsEndpoint(text)
+                : string.Empty;
+        }
+
+        private static string NormalizeHttpsEndpoint(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text) || text.Length > 2048)
+            {
+                return string.Empty;
+            }
+
+            Uri endpoint;
+            string endpointError;
+            return PublicHttpsEndpointPolicy.TryCreate(
+                text.Trim(),
+                out endpoint,
+                out endpointError)
+                ? endpoint.AbsoluteUri
+                : string.Empty;
+        }
+
+        private static void TryDelete(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                }
+            }
+            catch (Exception)
+            {
+                // Cleanup failures must not terminate monitoring.
             }
         }
     }
