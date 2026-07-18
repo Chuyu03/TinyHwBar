@@ -1533,7 +1533,7 @@ if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
 if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
     $candidateGitPaths.Add((Join-Path $env:ProgramFiles 'Git\mingw64\bin\git.exe'))
 }
-$pathGitCommand = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue
+$pathGitCommand = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -ne $pathGitCommand) {
     $pathGitDirectory = [IO.Directory]::GetParent($pathGitCommand.Source)
     if ($null -ne $pathGitDirectory) {
