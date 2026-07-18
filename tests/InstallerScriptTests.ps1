@@ -597,7 +597,7 @@ foreach ($invalidVersion in @(
     '1.2.03',
     '65535.0.0',
     '2147483648.0.0',
-    '１.2.3')) {
+    ([char]0xFF11 + '.2.3'))) {
     $invalidVersionBlocked = $false
     try {
         Get-CanonicalReleaseVersion $invalidVersion | Out-Null
