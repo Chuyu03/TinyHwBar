@@ -1519,6 +1519,9 @@ if (Test-InheritedSddlRuleRejected $fileOnlyInheritedSddl $false) {
     throw 'An InheritOnly ACE on a file was treated as a future-child write risk.'
 }
 
+$whatIfIntegrationRequired = Test-Path `
+    -LiteralPath (Join-Path $root '.git') `
+    -PathType Container
 $candidateGitPaths = New-Object Collections.Generic.List[string]
 $requiredBundledGitPath = $null
 if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
@@ -1610,7 +1613,8 @@ foreach ($candidateGitPath in @($candidateGitPaths | Select-Object -Unique)) {
     }
 }
 
-if ($null -ne $requiredBundledGitPath -and
+if ($whatIfIntegrationRequired -and
+    $null -ne $requiredBundledGitPath -and
     (Test-Path -LiteralPath $requiredBundledGitPath -PathType Leaf) -and
     $null -eq $gitForWhatIf) {
     throw (
@@ -1619,7 +1623,7 @@ if ($null -ne $requiredBundledGitPath -and
 }
 
 $whatIfIntegrationExecuted = $false
-if ($null -ne $gitForWhatIf) {
+if ($whatIfIntegrationRequired -and $null -ne $gitForWhatIf) {
     $whatIfRepoOutput = & $gitForWhatIf -C $root rev-parse --show-toplevel 2>$null
     $whatIfRepoExit = $LASTEXITCODE
     if ($whatIfRepoExit -eq 0 -and @($whatIfRepoOutput).Count -eq 1 -and
@@ -1697,7 +1701,8 @@ if ($null -ne $gitForWhatIf) {
         $whatIfIntegrationExecuted = $true
     }
 }
-if ($null -ne $requiredBundledGitPath -and
+if ($whatIfIntegrationRequired -and
+    $null -ne $requiredBundledGitPath -and
     (Test-Path -LiteralPath $requiredBundledGitPath -PathType Leaf) -and
     -not $whatIfIntegrationExecuted) {
     throw 'The bundled real Git exists, but the Prepare-Release -WhatIf integration test did not run.'
