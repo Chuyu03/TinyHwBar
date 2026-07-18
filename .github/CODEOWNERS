@@ -5,7 +5,10 @@
 /.github/workflows/ @Chuyu03
 /build.cmd @Chuyu03
 /test.cmd @Chuyu03
+/AGENTS.md @Chuyu03
+/CONTRIBUTING.md @Chuyu03
 /app.manifest @Chuyu03
+/src/AssemblyInfo.cs @Chuyu03
 /src/NativeMethods.cs @Chuyu03
 /src/HardwareSampler.cs @Chuyu03
 /src/IntelGpuSampler.cs @Chuyu03
@@ -24,4 +27,10 @@
 /tests/ @Chuyu03
 /tools/Install-TinyHwBar.ps1 @Chuyu03
 /tools/Uninstall-TinyHwBar.ps1 @Chuyu03
+/tools/Prepare-Release.ps1 @Chuyu03
+/tools/BinaryRelease-README.md @Chuyu03
+/README.md @Chuyu03
+/CHANGELOG.md @Chuyu03
 /SECURITY.md @Chuyu03
+/LICENSE @Chuyu03
+/docs/v3-plan.md @Chuyu03
