@@ -11,7 +11,7 @@
 - 项目面向 Windows 11 x64，使用系统 .NET Framework 4.8 C# 编译器；除非任务明确要求，不增加 SDK、包、服务、驱动或第三方依赖。
 - 替换或启动可执行文件前，先退出所有 TinyHwBar 实例。
 - 本地编译检查使用 `test.cmd --compile-only`，应用构建使用 `build.cmd`。
-- `test.cmd --compile-only` 不执行测试断言。完整 `test.cmd` 会运行未签名的临时测试 EXE，可能被 Smart App Control 阻止；保留 Windows 保护，并把策略阻止与测试失败明确区分。`2.0.0` 的完整测试发布证据是成功的 GitHub Actions Build；后续版本必须重新取得对应 CI 证据。
+- `test.cmd --compile-only` 会运行 PowerShell 安装、卸载和发布准备脚本安全断言并编译 C# 测试 EXE，但不运行 C# 测试断言。完整 `test.cmd` 会运行未签名的临时测试 EXE，可能被 Smart App Control 阻止；保留 Windows 保护，并把策略阻止与测试失败明确区分。`2.0.0` 的完整测试发布证据是成功的 GitHub Actions Build；后续版本必须重新取得对应 CI 证据。
 
 ## 产品与安全边界
 

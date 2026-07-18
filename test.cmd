@@ -7,11 +7,15 @@ set "FRAMEWORK=C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 set "POWERSHELL=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 set "COMPILE_ONLY=0"
 
+if "%~1"=="" goto arguments_valid
+if /i not "%~1"=="--compile-only" goto invalid_arguments
+if not "%~2"=="" goto invalid_arguments
+set "COMPILE_ONLY=1"
+
+:arguments_valid
 :choose_test_exe
 set "TEST_EXE=%TEMP%\TinyHwBar.Tests.%RANDOM%.%RANDOM%.exe"
 if exist "%TEST_EXE%" goto choose_test_exe
-
-if /i "%~1"=="--compile-only" set "COMPILE_ONLY=1"
 
 if not exist "%CSC%" (
     echo ERROR: .NET Framework compiler not found: "%CSC%"
@@ -25,7 +29,7 @@ if not exist "%POWERSHELL%" (
 
 "%POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tests\InstallerScriptTests.ps1"
 if errorlevel 1 (
-    echo ERROR: Installer script safety tests failed.
+    echo ERROR: PowerShell script safety tests failed.
     exit /b 1
 )
 
@@ -92,6 +96,11 @@ if not "%TEST_EXIT%"=="0" (
 )
 
 exit /b 0
+
+:invalid_arguments
+echo ERROR: Unsupported test arguments.
+echo Usage: test.cmd [--compile-only]
+exit /b 2
 
 :cleanup_test_exe
 if not exist "%TEST_EXE%" exit /b 0

@@ -44,11 +44,11 @@ jobs:
           }
 
           $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($path)
-          if ($version.FileVersion -ne '2.0.0.0') {
+          if ($version.FileVersion -ne '3.0.0.0') {
               throw "Unexpected file version: $($version.FileVersion)"
           }
 
-          if ($version.ProductVersion -ne '2.0.0') {
+          if ($version.ProductVersion -ne '3.0.0') {
               throw "Unexpected product version: $($version.ProductVersion)"
           }
 

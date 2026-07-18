@@ -8,6 +8,28 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-NonElevatedProcess {
+    param([string]$Operation)
+
+    $identity = $null
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw (
+                "$Operation must run from a normal, non-administrator Windows PowerShell session. " +
+                'Close the elevated shell and retry without Run as administrator.')
+        }
+    }
+    finally {
+        if ($null -ne $identity) {
+            $identity.Dispose()
+        }
+    }
+}
+
+Assert-NonElevatedProcess 'TinyHwBar uninstallation'
+
 $ownershipMarkerName = '.tinyhwbar-install-owner'
 $ownershipMarkerContent = 'TinyHwBar.UserInstall|2'
 $uninstallerName = 'Uninstall-TinyHwBar.ps1'
@@ -16,12 +38,13 @@ $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TinyH
 $startupRegistrySubKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $startupKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $startupName = 'TinyHwBar'
-$singletonMutexName = 'Local\TinyHwBar.Singleton'
 $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 if ([string]::IsNullOrWhiteSpace($currentUserSid)) {
     throw 'Windows did not return the current user SID required for cross-session maintenance locking.'
 }
 $maintenanceMutexName = 'Global\TinyHwBar.Maintenance.' + $currentUserSid
+$appSingletonMutexName = 'Global\TinyHwBar.Singleton.' + $currentUserSid
+$legacySingletonMutexName = 'Local\TinyHwBar.Singleton'
 
 function Get-TrustedSpecialFolderPath {
     param([Environment+SpecialFolder]$Folder)
@@ -45,6 +68,109 @@ function Test-PathEquals {
         [IO.Path]::GetFullPath($Left).TrimEnd('\'),
         [IO.Path]::GetFullPath($Right).TrimEnd('\'),
         [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-TinyHwBarProcessOwnerSid {
+    param($Process)
+
+    try {
+        $ownerResult = Invoke-CimMethod `
+            -InputObject $Process `
+            -MethodName GetOwnerSid `
+            -ErrorAction Stop
+        if ($null -eq $ownerResult -or
+            $ownerResult.ReturnValue -ne 0 -or
+            [string]::IsNullOrWhiteSpace([string]$ownerResult.Sid)) {
+            return $null
+        }
+        return ([string]$ownerResult.Sid).Trim()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-TinyHwBarProcessBlockers {
+    param(
+        [object[]]$Processes,
+        [string]$CurrentUserSid,
+        [string]$DestinationExe,
+        [scriptblock]$OwnerSidResolver)
+
+    if ([string]::IsNullOrWhiteSpace($CurrentUserSid) -or
+        [string]::IsNullOrWhiteSpace($DestinationExe)) {
+        throw 'Process blocker selection requires the current user SID and installed executable path.'
+    }
+
+    $blockingProcesses = @()
+    $unresolvedOwnerProcessIds = @()
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process) {
+            continue
+        }
+
+        $executablePath = [string]$process.ExecutablePath
+        if (-not [string]::IsNullOrWhiteSpace($executablePath) -and
+            (Test-PathEquals $executablePath $DestinationExe)) {
+            $blockingProcesses += ,$process
+            continue
+        }
+
+        try {
+            $ownerSidValues = @(
+                if ($null -eq $OwnerSidResolver) {
+                    Get-TinyHwBarProcessOwnerSid $process
+                }
+                else {
+                    & $OwnerSidResolver $process
+                })
+        }
+        catch {
+            $ownerSidValues = @()
+        }
+
+        if ($ownerSidValues.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$ownerSidValues[0])) {
+            $processIdProperty = $process.PSObject.Properties['ProcessId']
+            $unresolvedOwnerProcessIds += if ($null -eq $processIdProperty) {
+                '<unknown>'
+            }
+            else {
+                [string]$processIdProperty.Value
+            }
+            continue
+        }
+
+        $ownerSid = ([string]$ownerSidValues[0]).Trim()
+        if ([string]::Equals(
+            $ownerSid,
+            $CurrentUserSid,
+            [StringComparison]::OrdinalIgnoreCase)) {
+            $blockingProcesses += ,$process
+        }
+    }
+
+    return [pscustomobject]@{
+        BlockingProcesses = @($blockingProcesses)
+        UnresolvedOwnerProcessIds = @($unresolvedOwnerProcessIds)
+    }
+}
+
+function Write-TinyHwBarProcessOwnerWarning {
+    param($ProcessCheck)
+
+    $unresolvedCount = @($ProcessCheck.UnresolvedOwnerProcessIds).Count
+    if ($unresolvedCount -eq 0) {
+        return
+    }
+
+    Write-Warning (
+        "Windows could not resolve the owner SID for $unresolvedCount other normally named " +
+        'TinyHwBar.exe process(es). They were not treated as blockers because their executable ' +
+        'paths did not match this user''s installed TinyHwBar. New versions remain covered by the ' +
+        'current-user cross-session mutex; the residual uncertainty is limited to a legacy copy in ' +
+        'another session when Windows also denies its owner query. Ensure every TinyHwBar copy for ' +
+        'this Windows user is closed before continuing.') -WarningAction Continue
 }
 
 function Assert-DirectChildPath {
@@ -534,7 +660,7 @@ if (Test-Path -LiteralPath $destinationExe -PathType Leaf) {
         $expectedDisplayVersion = $installedVersionInfo.FileVersion
     }
     if ([string]::IsNullOrWhiteSpace($expectedDisplayVersion)) {
-        $expectedDisplayVersion = '2.0.0'
+        $expectedDisplayVersion = '3.0.0'
     }
 }
 $uninstallKeyOwned = $installOwned -and
@@ -554,8 +680,15 @@ if ($removeUserDataRequested -and $userDataPathExists -and
 }
 $removeUserDataNow = $false
 if ($removeUserDataRequested) {
-    if ($runningTinyHwBarProcesses.Count -ne 0) {
-        throw 'A TinyHwBar process is running. Exit every installed or portable copy before removing the shared user-data directory.'
+    $initialUserProcessCheck = Get-TinyHwBarProcessBlockers `
+        $runningTinyHwBarProcesses `
+        $currentUserSid `
+        $destinationExe
+    Write-TinyHwBarProcessOwnerWarning $initialUserProcessCheck
+    if (@($initialUserProcessCheck.BlockingProcesses).Count -ne 0) {
+        throw ('A TinyHwBar process for this Windows user, or a process using this user''s installed ' +
+            'TinyHwBar path, is running. Exit every installed or portable copy for this Windows ' +
+            'user before removing the shared user-data directory.')
     }
     if ($userDataPathExists) {
         Assert-NoReparseTree $userDataRoot
@@ -600,9 +733,13 @@ if (-not ($fileScopeApproved -and $startupScopeApproved -and $shortcutScopeAppro
 
 $maintenanceMutex = $null
 $maintenanceMutexAcquired = $false
-$singletonMutex = $null
-$singletonMutexAcquired = $false
+$appSingletonMutex = $null
+$appSingletonMutexAcquired = $false
+$legacySingletonMutex = $null
+$legacySingletonMutexAcquired = $false
 $userDataRemoved = $false
+$userDataRemovalFailed = $false
+$userDataRemovalFailureMessage = $null
 
 try {
     if ($maintenanceMutexRequired) {
@@ -618,27 +755,53 @@ try {
             throw 'Another TinyHwBar installation or uninstallation is active for this Windows user, possibly in another session. No installation artifacts or user data were changed; retry after it finishes.'
         }
 
-        $singletonMutex = [Threading.Mutex]::new($false, $singletonMutexName)
+        $appSingletonMutex = [Threading.Mutex]::new($false, $appSingletonMutexName)
         try {
-            $singletonMutexAcquired = $singletonMutex.WaitOne(0, $false)
+            $appSingletonMutexAcquired = $appSingletonMutex.WaitOne(0, $false)
         }
         catch [Threading.AbandonedMutexException] {
-            $singletonMutexAcquired = $true
+            $appSingletonMutexAcquired = $true
         }
 
-        if (-not $singletonMutexAcquired) {
+        if (-not $appSingletonMutexAcquired) {
             if ($removeUserDataRequested) {
-                throw 'A current-session TinyHwBar instance is using the shared user-data directory. No installation artifacts or user data were changed; exit every installed or portable copy and retry.'
+                throw 'A TinyHwBar instance for this Windows user, possibly in another session, is using the shared user-data directory. No installation artifacts or user data were changed; exit every installed or portable copy and retry.'
             }
-            throw 'A current-session TinyHwBar instance is running. No installation artifacts were changed; exit every installed or portable copy and retry.'
+            throw 'A TinyHwBar instance is running for this Windows user, possibly in another session. No installation artifacts were changed; exit every installed or portable copy and retry.'
         }
 
-        $runningAfterMutexAcquisition = @(Get-CimInstance Win32_Process -Filter "Name = 'TinyHwBar.exe'")
-        if ($runningAfterMutexAcquisition.Count -ne 0) {
+        $legacySingletonMutex = [Threading.Mutex]::new($false, $legacySingletonMutexName)
+        try {
+            $legacySingletonMutexAcquired = $legacySingletonMutex.WaitOne(0, $false)
+        }
+        catch [Threading.AbandonedMutexException] {
+            $legacySingletonMutexAcquired = $true
+        }
+
+        if (-not $legacySingletonMutexAcquired) {
             if ($removeUserDataRequested) {
-                throw 'A normally named TinyHwBar process is running. No installation artifacts or user data were changed; exit every installed or portable copy and retry.'
+                throw 'A legacy current-session TinyHwBar instance is using the shared user-data directory. No installation artifacts or user data were changed; exit every installed or portable copy and retry.'
             }
-            throw 'A normally named TinyHwBar process is running. No installation artifacts were changed; exit every installed or portable copy and retry.'
+            throw 'A legacy current-session TinyHwBar instance is running. No installation artifacts were changed; exit every installed or portable copy and retry.'
+        }
+
+        $runningAfterMutexAcquisition = @(
+            Get-CimInstance Win32_Process -Filter "Name = 'TinyHwBar.exe'")
+        $postMutexProcessCheck = Get-TinyHwBarProcessBlockers `
+            $runningAfterMutexAcquisition `
+            $currentUserSid `
+            $destinationExe
+        Write-TinyHwBarProcessOwnerWarning $postMutexProcessCheck
+        if (@($postMutexProcessCheck.BlockingProcesses).Count -ne 0) {
+            if ($removeUserDataRequested) {
+                throw ('A normally named TinyHwBar process for this Windows user, or a process using ' +
+                    'this user''s installed TinyHwBar path, is running. No installation artifacts or ' +
+                    'user data were changed; exit every installed or portable copy for this Windows ' +
+                    'user and retry.')
+            }
+            throw ('A normally named TinyHwBar process for this Windows user, or a process using this ' +
+                'user''s installed TinyHwBar path, is running. No installation artifacts were changed; ' +
+                'exit every installed or portable copy for this Windows user and retry.')
         }
     }
 
@@ -669,19 +832,6 @@ try {
             $ownershipMarkerContent,
             [StringComparison]::Ordinal)) {
             throw "The installation ownership marker changed before uninstall began: $markerPath"
-        }
-    }
-
-    if ($removeUserDataNow) {
-        Assert-NoReparseTree $userDataRoot
-        try {
-            Remove-Item -LiteralPath $userDataRoot -Recurse -Force
-            $userDataRemoved = $true
-        }
-        catch {
-            throw ("User-data removal failed and may be incomplete. This deletion cannot be rolled back; " +
-                "TinyHwBar installation artifacts were not changed. Review the remaining contents at: $userDataRoot. " +
-                $_.Exception.Message)
         }
     }
 
@@ -1049,13 +1199,7 @@ catch {
     }
 
     if ($rollbackErrors.Count -ne 0) {
-        $userDataState = if ($userDataRemoved) {
-            ' The explicitly requested user-data directory was already removed and cannot be restored.'
-        }
-        else {
-            ''
-        }
-        throw ($originalError.Message + $userDataState + ' Rollback was incomplete: ' + ($rollbackErrors -join ' | ') +
+        throw ($originalError.Message + ' Rollback was incomplete: ' + ($rollbackErrors -join ' | ') +
             " Backup files were preserved at: $transactionRoot")
     }
 
@@ -1073,17 +1217,6 @@ catch {
             Write-Warning ($rollbackState + ", but temporary transaction cleanup failed; " +
                 "review this owned path: $transactionRoot. " + $_.Exception.Message)
         }
-    }
-    if ($userDataRemoved) {
-        $artifactState = if ($uninstallMadeArtifactChanges) {
-            'Changes completed by this uninstall were rolled back. If another process changed installation artifacts concurrently, review the current files and registrations before retrying.'
-        }
-        else {
-            'No installation-artifact changes were completed by this uninstall. If another process changed them concurrently, review the current files and registrations before retrying.'
-        }
-        throw ($originalError.Message +
-            ' The explicitly requested user-data directory was already removed and cannot be restored. ' +
-            $artifactState + ' Correct the reported error and retry uninstall.')
     }
     throw $originalError
 }
@@ -1114,6 +1247,30 @@ if ($installOwned -and (Test-Path -LiteralPath $installRoot -PathType Container)
     }
 }
 
+# User data is intentionally the final destructive step. It is attempted only after
+# every rollback-capable installation-artifact operation has committed successfully.
+if ($removeUserDataNow) {
+    try {
+        if (-not (Test-Path -LiteralPath $userDataRoot -PathType Container)) {
+            throw 'The previously validated user-data directory is no longer a directory.'
+        }
+        Assert-NoReparseTree $userDataRoot
+        Remove-Item -LiteralPath $userDataRoot -Recurse -Force
+        if (Test-Path -LiteralPath $userDataRoot) {
+            throw 'The user-data directory still exists after the requested removal.'
+        }
+        $userDataRemoved = $true
+    }
+    catch {
+        $userDataRemovalFailed = $true
+        $userDataRemovalFailureMessage = (
+            "The rollback-capable TinyHwBar uninstall phase committed, but the explicitly requested " +
+            "user-data removal failed and may be incomplete. The deletion cannot be rolled back; " +
+            "review the remaining contents at: $userDataRoot. " + $_.Exception.Message)
+        Write-Warning $userDataRemovalFailureMessage
+    }
+}
+
     if ($anyOwnedArtifact) {
         Write-Host 'TinyHwBar-owned installation artifacts were removed for the current user.'
     }
@@ -1132,22 +1289,38 @@ if ($installOwned -and (Test-Path -LiteralPath $installRoot -PathType Container)
     if ($userDataRemoved) {
         Write-Host "The TinyHwBar user-data directory was removed: $userDataRoot"
     }
+    elseif ($userDataRemovalFailed) {
+        Write-Warning "The TinyHwBar user-data directory still requires manual review: $userDataRoot"
+    }
     elseif ($removeUserDataRequested) {
         Write-Host "No TinyHwBar user-data directory was present at removal time: $userDataRoot"
     }
     else {
         Write-Host "Settings and history were preserved: $userDataRoot"
     }
+    if ($userDataRemovalFailed) {
+        throw $userDataRemovalFailureMessage
+    }
 }
 finally {
-    if ($null -ne $singletonMutex) {
+    if ($null -ne $legacySingletonMutex) {
         try {
-            if ($singletonMutexAcquired) {
-                $singletonMutex.ReleaseMutex()
+            if ($legacySingletonMutexAcquired) {
+                $legacySingletonMutex.ReleaseMutex()
             }
         }
         finally {
-            $singletonMutex.Dispose()
+            $legacySingletonMutex.Dispose()
+        }
+    }
+    if ($null -ne $appSingletonMutex) {
+        try {
+            if ($appSingletonMutexAcquired) {
+                $appSingletonMutex.ReleaseMutex()
+            }
+        }
+        finally {
+            $appSingletonMutex.Dispose()
         }
     }
     if ($null -ne $maintenanceMutex) {

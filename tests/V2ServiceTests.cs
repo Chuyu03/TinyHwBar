@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
@@ -13,18 +14,28 @@ namespace TinyHwBar.Tests
     {
         internal static void RunAll()
         {
-            Run("startup registration boundaries", TestStartupRegistrationBoundaries);
-            Run("startup UNC write boundary", TestStartupUncWriteBoundary);
-            Run("startup mapped-drive write boundary", TestStartupMappedDriveWriteBoundary);
-            Run("update service boundaries", TestUpdateServiceBoundaries);
-            Run("update package staging boundaries", TestUpdatePackageStagingBoundaries);
-            Run("public HTTPS address policy", TestPublicHttpsAddressPolicy);
-            Run("production transport address preflight", TestProductionTransportAddressPreflight);
-            Run("loopback API disabled boundary", TestLoopbackApiDisabledBoundary);
-            Run("loopback API enabled contract", TestLoopbackApiEnabledContract);
-            Run("telemetry confirmation boundaries", TestTelemetryConfirmationBoundaries);
-            Run("telemetry preview invalidation", TestTelemetryPreviewInvalidation);
-            Run("diagnostic preview schema", TestDiagnosticPreviewSchema);
+            List<string> failures = new List<string>();
+            Run("startup registration boundaries", TestStartupRegistrationBoundaries, failures);
+            Run("startup UNC write boundary", TestStartupUncWriteBoundary, failures);
+            Run("startup mapped-drive write boundary", TestStartupMappedDriveWriteBoundary, failures);
+            Run("update service boundaries", TestUpdateServiceBoundaries, failures);
+            Run("update package staging boundaries", TestUpdatePackageStagingBoundaries, failures);
+            Run("public HTTPS address policy", TestPublicHttpsAddressPolicy, failures);
+            Run("production transport address preflight", TestProductionTransportAddressPreflight, failures);
+            Run("V3 transport user agents", TestV3TransportUserAgents, failures);
+            Run("loopback API disabled boundary", TestLoopbackApiDisabledBoundary, failures);
+            Run("loopback API enabled contract", TestLoopbackApiEnabledContract, failures);
+            Run("telemetry confirmation boundaries", TestTelemetryConfirmationBoundaries, failures);
+            Run("telemetry preview invalidation", TestTelemetryPreviewInvalidation, failures);
+            Run("diagnostic preview schema", TestDiagnosticPreviewSchema, failures);
+
+            if (failures.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    failures.Count.ToString() +
+                    " advanced service test(s) failed: " +
+                    string.Join(" | ", failures.ToArray()));
+            }
         }
 
         private static void TestStartupRegistrationBoundaries()
@@ -385,6 +396,22 @@ namespace TinyHwBar.Tests
             Assert(
                 resolver.CallCount == 3,
                 "a production transport skipped the injected DNS preflight");
+        }
+
+        private static void TestV3TransportUserAgents()
+        {
+            Assert(
+                HttpWebRequestUpdateTransport.UserAgentValue ==
+                    "TinyHwBar/3 update-check",
+                "the update-check transport did not identify V3");
+            Assert(
+                HttpWebRequestUpdatePackageTransport.UserAgentValue ==
+                    "TinyHwBar/3 update-package",
+                "the update-package transport did not identify V3");
+            Assert(
+                HttpWebRequestTelemetryTransport.UserAgentValue ==
+                    "TinyHwBar/3 telemetry",
+                "the telemetry transport did not identify V3");
         }
 
         private static void TestUpdatePackageStagingBoundaries()
@@ -1012,10 +1039,20 @@ namespace TinyHwBar.Tests
             }
         }
 
-        private static void Run(string name, Action test)
+        private static void Run(
+            string name,
+            Action test,
+            IList<string> failures)
         {
-            test();
-            Console.WriteLine("PASS: " + name);
+            try
+            {
+                test();
+                Console.WriteLine("PASS: " + name);
+            }
+            catch (Exception ex)
+            {
+                failures.Add(name + " - " + ex.Message);
+            }
         }
 
         private static void Assert(bool condition, string message)

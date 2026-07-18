@@ -9,6 +9,28 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-NonElevatedProcess {
+    param([string]$Operation)
+
+    $identity = $null
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw (
+                "$Operation must run from a normal, non-administrator Windows PowerShell session. " +
+                'Close the elevated shell and retry without Run as administrator.')
+        }
+    }
+    finally {
+        if ($null -ne $identity) {
+            $identity.Dispose()
+        }
+    }
+}
+
+Assert-NonElevatedProcess 'TinyHwBar installation'
+
 if ([string]::IsNullOrWhiteSpace($SourceExe)) {
     $SourceExe = Join-Path (Split-Path -Parent $PSScriptRoot) 'outputs\TinyHwBar.exe'
 }
@@ -18,12 +40,13 @@ $ownershipMarkerContent = 'TinyHwBar.UserInstall|2'
 $uninstallerName = 'Uninstall-TinyHwBar.ps1'
 $uninstallRegistrySubKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\TinyHwBar'
 $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\TinyHwBar'
-$singletonMutexName = 'Local\TinyHwBar.Singleton'
 $currentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 if ([string]::IsNullOrWhiteSpace($currentUserSid)) {
     throw 'Windows did not return the current user SID required for cross-session maintenance locking.'
 }
 $maintenanceMutexName = 'Global\TinyHwBar.Maintenance.' + $currentUserSid
+$appSingletonMutexName = 'Global\TinyHwBar.Singleton.' + $currentUserSid
+$legacySingletonMutexName = 'Local\TinyHwBar.Singleton'
 $uninstallValueNames = @(
     'DisplayName',
     'DisplayVersion',
@@ -55,6 +78,157 @@ function Test-PathEquals {
         [IO.Path]::GetFullPath($Left).TrimEnd('\'),
         [IO.Path]::GetFullPath($Right).TrimEnd('\'),
         [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-TinyHwBarProcessOwnerSid {
+    param($Process)
+
+    try {
+        $ownerResult = Invoke-CimMethod `
+            -InputObject $Process `
+            -MethodName GetOwnerSid `
+            -ErrorAction Stop
+        if ($null -eq $ownerResult -or
+            $ownerResult.ReturnValue -ne 0 -or
+            [string]::IsNullOrWhiteSpace([string]$ownerResult.Sid)) {
+            return $null
+        }
+        return ([string]$ownerResult.Sid).Trim()
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-TinyHwBarProcessBlockers {
+    param(
+        [object[]]$Processes,
+        [string]$CurrentUserSid,
+        [string]$DestinationExe,
+        [scriptblock]$OwnerSidResolver)
+
+    if ([string]::IsNullOrWhiteSpace($CurrentUserSid) -or
+        [string]::IsNullOrWhiteSpace($DestinationExe)) {
+        throw 'Process blocker selection requires the current user SID and installed executable path.'
+    }
+
+    $blockingProcesses = @()
+    $unresolvedOwnerProcessIds = @()
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process) {
+            continue
+        }
+
+        $executablePath = [string]$process.ExecutablePath
+        if (-not [string]::IsNullOrWhiteSpace($executablePath) -and
+            (Test-PathEquals $executablePath $DestinationExe)) {
+            $blockingProcesses += ,$process
+            continue
+        }
+
+        try {
+            $ownerSidValues = @(
+                if ($null -eq $OwnerSidResolver) {
+                    Get-TinyHwBarProcessOwnerSid $process
+                }
+                else {
+                    & $OwnerSidResolver $process
+                })
+        }
+        catch {
+            $ownerSidValues = @()
+        }
+
+        if ($ownerSidValues.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$ownerSidValues[0])) {
+            $processIdProperty = $process.PSObject.Properties['ProcessId']
+            $unresolvedOwnerProcessIds += if ($null -eq $processIdProperty) {
+                '<unknown>'
+            }
+            else {
+                [string]$processIdProperty.Value
+            }
+            continue
+        }
+
+        $ownerSid = ([string]$ownerSidValues[0]).Trim()
+        if ([string]::Equals(
+            $ownerSid,
+            $CurrentUserSid,
+            [StringComparison]::OrdinalIgnoreCase)) {
+            $blockingProcesses += ,$process
+        }
+    }
+
+    return [pscustomobject]@{
+        BlockingProcesses = @($blockingProcesses)
+        UnresolvedOwnerProcessIds = @($unresolvedOwnerProcessIds)
+    }
+}
+
+function Write-TinyHwBarProcessOwnerWarning {
+    param($ProcessCheck)
+
+    $unresolvedCount = @($ProcessCheck.UnresolvedOwnerProcessIds).Count
+    if ($unresolvedCount -eq 0) {
+        return
+    }
+
+    Write-Warning (
+        "Windows could not resolve the owner SID for $unresolvedCount other normally named " +
+        'TinyHwBar.exe process(es). They were not treated as blockers because their executable ' +
+        'paths did not match this user''s installed TinyHwBar. New versions remain covered by the ' +
+        'current-user cross-session mutex; the residual uncertainty is limited to a legacy copy in ' +
+        'another session when Windows also denies its owner query. Ensure every TinyHwBar copy for ' +
+        'this Windows user is closed before continuing.') -WarningAction Continue
+}
+
+function Get-ValidatedLocalFixedFilePath {
+    param([string]$Path, [string]$Description)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        $Path.StartsWith('\\', [StringComparison]::Ordinal) -or
+        $Path.StartsWith('//', [StringComparison]::Ordinal) -or
+        [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Path)) {
+        throw "$Description must be a local fixed-drive path without wildcard or device syntax."
+    }
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root) -or
+        $fullPath.Substring($root.Length).Contains(':')) {
+        throw "$Description does not have a trusted local filesystem path."
+    }
+
+    try {
+        $drive = [IO.DriveInfo]::new($root)
+    }
+    catch {
+        throw ("Could not verify the local fixed drive for $Description. " + $_.Exception.Message)
+    }
+    if ($drive.DriveType -ne [IO.DriveType]::Fixed) {
+        throw "$Description must be on a local fixed drive; detected $($drive.DriveType)."
+    }
+
+    $candidate = $fullPath
+    while (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        if (Test-Path -LiteralPath $candidate) {
+            $item = Get-Item -LiteralPath $candidate -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Description has a reparse-point ancestor: $candidate"
+            }
+        }
+        if (Test-PathEquals $candidate $root) {
+            break
+        }
+        $parent = [IO.Directory]::GetParent($candidate)
+        if ($null -eq $parent) {
+            break
+        }
+        $candidate = $parent.FullName
+    }
+
+    return $fullPath
 }
 
 function Assert-DirectChildPath {
@@ -275,10 +449,616 @@ function Get-ExecutableDisplayVersion {
         $displayVersion = $versionInfo.FileVersion
     }
     if ([string]::IsNullOrWhiteSpace($displayVersion)) {
-        $displayVersion = '2.0.0'
+        $displayVersion = '3.0.0'
     }
 
     return $displayVersion
+}
+
+function Get-TinyHwBarCliAssemblyMetadata {
+    param([string]$Path, [Version]$ExpectedVersion)
+
+    if ($null -eq $ExpectedVersion) {
+        throw 'Expected TinyHwBar assembly version is required.'
+    }
+
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read)
+        $reader = New-Object IO.BinaryReader($stream)
+        [long]$fileLength = $stream.Length
+        if ($fileLength -lt 256 -or $fileLength -gt 536870912L) {
+            throw 'TinyHwBar executable has an unsafe file size.'
+        }
+
+        $assertRange = {
+            param([long]$Offset, [long]$Count, [long]$Limit, [string]$Description)
+
+            if ($Offset -lt 0 -or $Count -lt 0 -or $Offset -gt $Limit -or
+                $Count -gt ($Limit - $Offset)) {
+                throw "$Description is outside the containing binary range."
+            }
+        }
+        $readHeapIndex = {
+            param([int]$Width)
+
+            if ($Width -eq 2) {
+                return [long]$reader.ReadUInt16()
+            }
+            if ($Width -eq 4) {
+                return [long]$reader.ReadUInt32()
+            }
+            throw 'CLI metadata used an unsupported heap-index width.'
+        }
+
+        & $assertRange 0 64 $fileLength 'DOS header'
+        if ($reader.ReadUInt16() -ne 0x5A4D) {
+            throw 'TinyHwBar executable has an invalid DOS signature.'
+        }
+        $stream.Position = 0x3C
+        [long]$peOffset = $reader.ReadInt32()
+        & $assertRange $peOffset 24 $fileLength 'PE and COFF headers'
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            throw 'TinyHwBar executable has an invalid PE signature.'
+        }
+        $machine = $reader.ReadUInt16()
+        $sectionCount = $reader.ReadUInt16()
+        $stream.Position += 12
+        $optionalHeaderSize = $reader.ReadUInt16()
+        $characteristics = $reader.ReadUInt16()
+        if ($machine -ne 0x8664 -or $sectionCount -lt 1 -or $sectionCount -gt 96) {
+            throw 'TinyHwBar executable is not a bounded AMD64 PE image.'
+        }
+        if (($characteristics -band 0x0002) -eq 0 -or
+            ($characteristics -band 0x2000) -ne 0) {
+            throw 'TinyHwBar executable must be an executable image and must not be a DLL.'
+        }
+
+        [long]$optionalHeaderOffset = $peOffset + 24
+        if ($optionalHeaderSize -lt 240) {
+            throw 'TinyHwBar executable has a truncated PE32+ optional header.'
+        }
+        & $assertRange $optionalHeaderOffset $optionalHeaderSize $fileLength 'PE32+ optional header'
+        $stream.Position = $optionalHeaderOffset
+        if ($reader.ReadUInt16() -ne 0x020B) {
+            throw 'TinyHwBar executable is not a PE32+ image.'
+        }
+        $stream.Position = $optionalHeaderOffset + 60
+        [long]$sizeOfHeaders = $reader.ReadUInt32()
+        $stream.Position = $optionalHeaderOffset + 68
+        $subsystem = $reader.ReadUInt16()
+        if ($subsystem -ne 2) {
+            throw 'TinyHwBar executable is not a Windows GUI image.'
+        }
+        $stream.Position = $optionalHeaderOffset + 108
+        $directoryCount = $reader.ReadUInt32()
+        if ($directoryCount -lt 15 -or
+            (112L + ([long]$directoryCount * 8L)) -gt $optionalHeaderSize) {
+            throw 'TinyHwBar executable has an invalid PE data-directory table.'
+        }
+        $stream.Position = $optionalHeaderOffset + 224
+        [long]$clrRva = $reader.ReadUInt32()
+        [long]$clrDirectorySize = $reader.ReadUInt32()
+        if ($clrRva -eq 0 -or $clrDirectorySize -lt 72) {
+            throw 'TinyHwBar executable does not contain a complete CLR header.'
+        }
+
+        [long]$sectionTableOffset = $optionalHeaderOffset + $optionalHeaderSize
+        [long]$sectionTableSize = [long]$sectionCount * 40L
+        & $assertRange $sectionTableOffset $sectionTableSize $fileLength 'PE section table'
+        [long]$sectionTableEnd = $sectionTableOffset + $sectionTableSize
+        if ($sizeOfHeaders -lt $sectionTableEnd -or $sizeOfHeaders -gt $fileLength) {
+            throw 'TinyHwBar executable has an invalid SizeOfHeaders boundary.'
+        }
+        $sections = New-Object Collections.Generic.List[object]
+        for ($sectionIndex = 0; $sectionIndex -lt $sectionCount; $sectionIndex++) {
+            [long]$sectionOffset = $sectionTableOffset + ([long]$sectionIndex * 40L)
+            $stream.Position = $sectionOffset + 8
+            [long]$virtualSize = $reader.ReadUInt32()
+            [long]$virtualAddress = $reader.ReadUInt32()
+            [long]$rawSize = $reader.ReadUInt32()
+            [long]$rawOffset = $reader.ReadUInt32()
+            [long]$virtualSpan = [Math]::Max($virtualSize, $rawSize)
+            if ($virtualSpan -le 0 -or
+                $virtualAddress -gt 4294967295L -or
+                $virtualSpan -gt (4294967296L - $virtualAddress) -or
+                $rawOffset -gt $fileLength -or
+                $rawSize -gt ($fileLength - $rawOffset)) {
+                throw 'TinyHwBar executable contains an invalid PE section range.'
+            }
+            if ($rawSize -gt 0 -and $rawOffset -lt $sizeOfHeaders) {
+                throw 'TinyHwBar executable has section data overlapping its PE headers.'
+            }
+            $sections.Add([pscustomobject]@{
+                VirtualAddress = $virtualAddress
+                VirtualSpan = $virtualSpan
+                RawOffset = $rawOffset
+                RawSize = $rawSize
+            })
+        }
+        for ($leftIndex = 0; $leftIndex -lt $sections.Count; $leftIndex++) {
+            for ($rightIndex = $leftIndex + 1; $rightIndex -lt $sections.Count; $rightIndex++) {
+                $leftSection = $sections[$leftIndex]
+                $rightSection = $sections[$rightIndex]
+                $virtualOverlap =
+                    $leftSection.VirtualAddress -lt
+                        ($rightSection.VirtualAddress + $rightSection.VirtualSpan) -and
+                    $rightSection.VirtualAddress -lt
+                        ($leftSection.VirtualAddress + $leftSection.VirtualSpan)
+                $rawOverlap = $leftSection.RawSize -gt 0 -and $rightSection.RawSize -gt 0 -and
+                    $leftSection.RawOffset -lt ($rightSection.RawOffset + $rightSection.RawSize) -and
+                    $rightSection.RawOffset -lt ($leftSection.RawOffset + $leftSection.RawSize)
+                if ($virtualOverlap -or $rawOverlap) {
+                    throw 'TinyHwBar executable contains overlapping PE sections.'
+                }
+            }
+        }
+
+        $mapRva = {
+            param([long]$Rva, [long]$Size, [string]$Description)
+
+            if ($Rva -le 0 -or $Size -le 0) {
+                throw "$Description has an empty RVA range."
+            }
+            $matches = @()
+            foreach ($section in $sections) {
+                if ($Rva -lt $section.VirtualAddress -or
+                    $Rva -ge ($section.VirtualAddress + $section.VirtualSpan)) {
+                    continue
+                }
+                [long]$delta = $Rva - $section.VirtualAddress
+                if ($Size -gt ($section.VirtualSpan - $delta) -or
+                    $delta -gt $section.RawSize -or
+                    $Size -gt ($section.RawSize - $delta)) {
+                    continue
+                }
+                [long]$candidateOffset = $section.RawOffset + $delta
+                & $assertRange $candidateOffset $Size $fileLength $Description
+                $matches += $candidateOffset
+            }
+            if ($matches.Count -ne 1) {
+                throw "$Description does not map to exactly one PE section."
+            }
+            return [long]$matches[0]
+        }
+
+        [long]$clrOffset = & $mapRva $clrRva 72 'CLR header'
+        $stream.Position = $clrOffset
+        [long]$clrHeaderSize = $reader.ReadUInt32()
+        if ($clrHeaderSize -lt 72 -or $clrHeaderSize -gt $clrDirectorySize) {
+            throw 'TinyHwBar executable has an invalid CLR header size.'
+        }
+        [long]$completeClrOffset = & $mapRva $clrRva $clrHeaderSize 'Complete CLR header'
+        if ($completeClrOffset -ne $clrOffset) {
+            throw 'TinyHwBar executable has an inconsistent CLR header mapping.'
+        }
+        [void]$reader.ReadUInt16()
+        [void]$reader.ReadUInt16()
+        [long]$metadataRva = $reader.ReadUInt32()
+        [long]$metadataSize = $reader.ReadUInt32()
+        [long]$clrFlagsOffset = $stream.Position
+        [long]$clrFlags = $reader.ReadUInt32()
+        if ($clrFlags -ne 1) {
+            throw 'TinyHwBar executable has unsafe or non-AMD64 CLR image flags.'
+        }
+        if ($metadataSize -lt 32 -or $metadataSize -gt 134217728L) {
+            throw 'TinyHwBar executable has an invalid CLR metadata size.'
+        }
+        [long]$metadataOffset = & $mapRva $metadataRva $metadataSize 'CLR metadata'
+        [long]$metadataEnd = $metadataOffset + $metadataSize
+
+        & $assertRange $metadataOffset 16 $metadataEnd 'CLI metadata root'
+        $stream.Position = $metadataOffset
+        if ($reader.ReadUInt32() -ne 0x424A5342) {
+            throw 'TinyHwBar executable has an invalid BSJB metadata signature.'
+        }
+        [void]$reader.ReadUInt16()
+        [void]$reader.ReadUInt16()
+        if ($reader.ReadUInt32() -ne 0) {
+            throw 'TinyHwBar executable has an invalid CLI metadata reserved value.'
+        }
+        [long]$versionLength = $reader.ReadUInt32()
+        if ($versionLength -lt 1 -or $versionLength -gt 256) {
+            throw 'TinyHwBar executable has an invalid CLI metadata version string length.'
+        }
+        & $assertRange $stream.Position $versionLength $metadataEnd 'CLI metadata version string'
+        $versionBytes = $reader.ReadBytes([int]$versionLength)
+        if ($versionBytes.Length -ne $versionLength -or $versionBytes[$versionBytes.Length - 1] -ne 0) {
+            throw 'TinyHwBar executable has an unterminated CLI metadata version string.'
+        }
+        [long]$afterVersion = $stream.Position
+        [long]$alignedAfterVersion = $metadataOffset +
+            ([long][Math]::Ceiling(($afterVersion - $metadataOffset) / 4.0) * 4L)
+        & $assertRange $alignedAfterVersion 4 $metadataEnd 'CLI metadata stream-count header'
+        $stream.Position = $alignedAfterVersion
+        [void]$reader.ReadUInt16()
+        $streamCount = $reader.ReadUInt16()
+        if ($streamCount -lt 2 -or $streamCount -gt 32) {
+            throw 'TinyHwBar executable has an invalid CLI metadata stream count.'
+        }
+
+        $metadataStreams = New-Object Collections.Generic.List[object]
+        $streamNames = @{}
+        for ($metadataStreamIndex = 0; $metadataStreamIndex -lt $streamCount; $metadataStreamIndex++) {
+            & $assertRange $stream.Position 8 $metadataEnd 'CLI metadata stream header'
+            [long]$relativeStreamOffset = $reader.ReadUInt32()
+            [long]$relativeStreamSize = $reader.ReadUInt32()
+            [long]$streamNameOffset = $stream.Position
+            $streamNameBytes = New-Object Collections.Generic.List[byte]
+            $streamNameTerminated = $false
+            for ($nameIndex = 0; $nameIndex -lt 32; $nameIndex++) {
+                & $assertRange $stream.Position 1 $metadataEnd 'CLI metadata stream name'
+                $nameByte = $reader.ReadByte()
+                if ($nameByte -eq 0) {
+                    $streamNameTerminated = $true
+                    break
+                }
+                if ($nameByte -lt 0x21 -or $nameByte -gt 0x7E) {
+                    throw 'TinyHwBar executable has a non-ASCII CLI metadata stream name.'
+                }
+                [void]$streamNameBytes.Add($nameByte)
+            }
+            if (-not $streamNameTerminated -or $streamNameBytes.Count -eq 0) {
+                throw 'TinyHwBar executable has an invalid CLI metadata stream name.'
+            }
+            $streamName = [Text.Encoding]::ASCII.GetString($streamNameBytes.ToArray())
+            if ($streamNames.ContainsKey($streamName)) {
+                throw "TinyHwBar executable has a duplicate CLI metadata stream: $streamName"
+            }
+            $streamNames[$streamName] = $true
+            [long]$nameFieldLength = $stream.Position - $streamNameOffset
+            [long]$paddedNameLength = [long][Math]::Ceiling($nameFieldLength / 4.0) * 4L
+            [long]$nextStreamHeader = $streamNameOffset + $paddedNameLength
+            & $assertRange $nextStreamHeader 0 $metadataEnd 'CLI metadata stream-name padding'
+            $stream.Position = $nextStreamHeader
+            if ($relativeStreamSize -le 0 -or
+                $relativeStreamOffset -gt $metadataSize -or
+                $relativeStreamSize -gt ($metadataSize - $relativeStreamOffset)) {
+                throw "TinyHwBar executable has an invalid CLI metadata stream range: $streamName"
+            }
+            $metadataStreams.Add([pscustomobject]@{
+                Name = $streamName
+                Offset = $metadataOffset + $relativeStreamOffset
+                Size = $relativeStreamSize
+            })
+        }
+        [long]$streamHeadersEnd = $stream.Position
+        for ($leftIndex = 0; $leftIndex -lt $metadataStreams.Count; $leftIndex++) {
+            $leftMetadataStream = $metadataStreams[$leftIndex]
+            if ($leftMetadataStream.Offset -lt $streamHeadersEnd) {
+                throw 'TinyHwBar executable has a metadata stream overlapping its headers.'
+            }
+            for ($rightIndex = $leftIndex + 1; $rightIndex -lt $metadataStreams.Count; $rightIndex++) {
+                $rightMetadataStream = $metadataStreams[$rightIndex]
+                if ($leftMetadataStream.Offset -lt
+                        ($rightMetadataStream.Offset + $rightMetadataStream.Size) -and
+                    $rightMetadataStream.Offset -lt
+                        ($leftMetadataStream.Offset + $leftMetadataStream.Size)) {
+                    throw 'TinyHwBar executable contains overlapping CLI metadata streams.'
+                }
+            }
+        }
+
+        $tablesStreams = @($metadataStreams | Where-Object {
+            $_.Name -eq '#~' -or $_.Name -eq '#-'
+        })
+        $stringsStreams = @($metadataStreams | Where-Object { $_.Name -eq '#Strings' })
+        if ($tablesStreams.Count -ne 1 -or $stringsStreams.Count -ne 1) {
+            throw 'TinyHwBar executable must contain one tables stream and one #Strings stream.'
+        }
+        $tablesStream = $tablesStreams[0]
+        $stringsStream = $stringsStreams[0]
+        $stream.Position = $stringsStream.Offset
+        if ($reader.ReadByte() -ne 0) {
+            throw 'TinyHwBar executable has an invalid #Strings heap origin.'
+        }
+
+        [long]$tablesEnd = $tablesStream.Offset + $tablesStream.Size
+        & $assertRange $tablesStream.Offset 24 $tablesEnd 'CLI tables stream header'
+        $stream.Position = $tablesStream.Offset
+        if ($reader.ReadUInt32() -ne 0) {
+            throw 'TinyHwBar executable has an invalid CLI tables reserved value.'
+        }
+        $tablesMajor = $reader.ReadByte()
+        $tablesMinor = $reader.ReadByte()
+        $heapSizes = $reader.ReadByte()
+        $tablesReserved = $reader.ReadByte()
+        if ($tablesMajor -ne 2 -or $tablesMinor -ne 0 -or
+            ($heapSizes -band 0xF8) -ne 0) {
+            throw 'TinyHwBar executable has an unsupported CLI tables-stream header.'
+        }
+        [uint32]$validLow = $reader.ReadUInt32()
+        [uint32]$validHigh = $reader.ReadUInt32()
+        [void]$reader.ReadUInt32()
+        [void]$reader.ReadUInt32()
+        if (($validHigh -band 4294959104) -ne 0) {
+            throw 'TinyHwBar executable uses a reserved CLI metadata table.'
+        }
+
+        $rowCounts = [long[]](@(0L) * 45)
+        for ($tableIndex = 0; $tableIndex -le 44; $tableIndex++) {
+            $bitIndex = if ($tableIndex -lt 32) { $tableIndex } else { $tableIndex - 32 }
+            [uint32]$bitMask = [uint32]([uint64]1 -shl $bitIndex)
+            $tablePresent = if ($tableIndex -lt 32) {
+                ($validLow -band $bitMask) -ne 0
+            }
+            else {
+                ($validHigh -band $bitMask) -ne 0
+            }
+            if ($tablePresent) {
+                & $assertRange $stream.Position 4 $tablesEnd 'CLI metadata table row count'
+                $rowCounts[$tableIndex] = [long]$reader.ReadUInt32()
+            }
+        }
+        if ($rowCounts[0] -ne 1 -or $rowCounts[32] -ne 1) {
+            throw 'TinyHwBar executable must contain exactly one Module row and one Assembly row.'
+        }
+
+        $stringIndexSize = if (($heapSizes -band 0x01) -ne 0) { 4 } else { 2 }
+        $guidIndexSize = if (($heapSizes -band 0x02) -ne 0) { 4 } else { 2 }
+        $blobIndexSize = if (($heapSizes -band 0x04) -ne 0) { 4 } else { 2 }
+        $getTableIndexSize = {
+            param([int]$Table)
+            if ($rowCounts[$Table] -lt 65536L) { return 2 }
+            return 4
+        }
+        $getCodedIndexSize = {
+            param([int[]]$Tables, [int]$TagBits)
+
+            [long]$maximumRows = 0
+            foreach ($table in $Tables) {
+                if ($rowCounts[$table] -gt $maximumRows) {
+                    $maximumRows = $rowCounts[$table]
+                }
+            }
+            [long]$smallIndexLimit = [long][Math]::Pow(2, 16 - $TagBits)
+            if ($maximumRows -lt $smallIndexLimit) { return 2 }
+            return 4
+        }
+
+        $rowSizes = [long[]](@(0L) * 45)
+        for ($tableIndex = 0; $tableIndex -le 44; $tableIndex++) {
+            [long]$rowSize = switch ($tableIndex) {
+                0 { 2 + $stringIndexSize + (3 * $guidIndexSize) }
+                1 { (& $getCodedIndexSize @(0, 26, 35, 1) 2) + (2 * $stringIndexSize) }
+                2 { 4 + (2 * $stringIndexSize) + (& $getCodedIndexSize @(2, 1, 27) 2) + (& $getTableIndexSize 4) + (& $getTableIndexSize 6) }
+                3 { & $getTableIndexSize 4 }
+                4 { 2 + $stringIndexSize + $blobIndexSize }
+                5 { & $getTableIndexSize 6 }
+                6 { 8 + $stringIndexSize + $blobIndexSize + (& $getTableIndexSize 8) }
+                7 { & $getTableIndexSize 8 }
+                8 { 4 + $stringIndexSize }
+                9 { (& $getTableIndexSize 2) + (& $getCodedIndexSize @(2, 1, 27) 2) }
+                10 { (& $getCodedIndexSize @(2, 1, 26, 6, 27) 3) + $stringIndexSize + $blobIndexSize }
+                11 { 2 + (& $getCodedIndexSize @(4, 8, 23) 2) + $blobIndexSize }
+                12 { (& $getCodedIndexSize @(6, 4, 1, 2, 8, 9, 10, 0, 14, 23, 20, 17, 26, 27, 32, 35, 38, 39, 40, 42, 44, 43) 5) + (& $getCodedIndexSize @(6, 10) 3) + $blobIndexSize }
+                13 { (& $getCodedIndexSize @(4, 8) 1) + $blobIndexSize }
+                14 { 2 + (& $getCodedIndexSize @(2, 6, 32) 2) + $blobIndexSize }
+                15 { 6 + (& $getTableIndexSize 2) }
+                16 { 4 + (& $getTableIndexSize 4) }
+                17 { $blobIndexSize }
+                18 { (& $getTableIndexSize 2) + (& $getTableIndexSize 20) }
+                19 { & $getTableIndexSize 20 }
+                20 { 2 + $stringIndexSize + (& $getCodedIndexSize @(2, 1, 27) 2) }
+                21 { (& $getTableIndexSize 2) + (& $getTableIndexSize 23) }
+                22 { & $getTableIndexSize 23 }
+                23 { 2 + $stringIndexSize + $blobIndexSize }
+                24 { 2 + (& $getTableIndexSize 6) + (& $getCodedIndexSize @(20, 23) 1) }
+                25 { (& $getTableIndexSize 2) + (2 * (& $getCodedIndexSize @(6, 10) 1)) }
+                26 { $stringIndexSize }
+                27 { $blobIndexSize }
+                28 { 2 + (& $getCodedIndexSize @(4, 6) 1) + $stringIndexSize + (& $getTableIndexSize 26) }
+                29 { 4 + (& $getTableIndexSize 4) }
+                30 { 8 }
+                31 { 4 }
+                32 { 16 + $blobIndexSize + (2 * $stringIndexSize) }
+                33 { 4 }
+                34 { 12 }
+                35 { 12 + (2 * $blobIndexSize) + (2 * $stringIndexSize) }
+                36 { 4 + (& $getTableIndexSize 35) }
+                37 { 12 + (& $getTableIndexSize 35) }
+                38 { 4 + $stringIndexSize + $blobIndexSize }
+                39 { 8 + (2 * $stringIndexSize) + (& $getCodedIndexSize @(38, 35, 39) 2) }
+                40 { 8 + $stringIndexSize + (& $getCodedIndexSize @(38, 35, 39) 2) }
+                41 { 2 * (& $getTableIndexSize 2) }
+                42 { 4 + (& $getCodedIndexSize @(2, 6) 1) + $stringIndexSize }
+                43 { (& $getCodedIndexSize @(6, 10) 1) + $blobIndexSize }
+                44 { (& $getTableIndexSize 42) + (& $getCodedIndexSize @(2, 1, 27) 2) }
+            }
+            if ($rowSize -le 0) {
+                throw "TinyHwBar executable has an unsupported CLI metadata table: $tableIndex"
+            }
+            $rowSizes[$tableIndex] = $rowSize
+        }
+
+        $tableOffsets = [long[]](@(0L) * 45)
+        [long]$tableDataOffset = $stream.Position
+        for ($tableIndex = 0; $tableIndex -le 44; $tableIndex++) {
+            if ($rowCounts[$tableIndex] -eq 0) {
+                continue
+            }
+            [long]$rowSize = $rowSizes[$tableIndex]
+            if ($rowCounts[$tableIndex] -gt ([long]::MaxValue / $rowSize)) {
+                throw 'TinyHwBar executable has an overflowing CLI metadata table size.'
+            }
+            [long]$tableSize = $rowCounts[$tableIndex] * $rowSize
+            & $assertRange $tableDataOffset $tableSize $tablesEnd "CLI metadata table $tableIndex"
+            $tableOffsets[$tableIndex] = $tableDataOffset
+            $tableDataOffset += $tableSize
+        }
+        [long]$trailingTableBytes = $tablesEnd - $tableDataOffset
+        if ($trailingTableBytes -lt 0 -or $trailingTableBytes -gt 4) {
+            throw 'TinyHwBar executable has unexpected data after its CLI metadata tables.'
+        }
+        $stream.Position = $tableDataOffset
+        for ($paddingIndex = 0; $paddingIndex -lt $trailingTableBytes; $paddingIndex++) {
+            if ($reader.ReadByte() -ne 0) {
+                throw 'TinyHwBar executable has nonzero CLI metadata table padding.'
+            }
+        }
+
+        [long]$assemblyOffset = $tableOffsets[32]
+        & $assertRange $assemblyOffset $rowSizes[32] $tablesEnd 'CLI Assembly row'
+        $stream.Position = $assemblyOffset
+        [void]$reader.ReadUInt32()
+        [long]$assemblyVersionOffset = $stream.Position
+        $assemblyMajor = $reader.ReadUInt16()
+        $assemblyMinor = $reader.ReadUInt16()
+        $assemblyBuild = $reader.ReadUInt16()
+        $assemblyRevision = $reader.ReadUInt16()
+        $assemblyFlags = $reader.ReadUInt32()
+        [long]$publicKeyIndex = & $readHeapIndex $blobIndexSize
+        [long]$assemblyNameIndex = & $readHeapIndex $stringIndexSize
+        [long]$assemblyCultureIndex = & $readHeapIndex $stringIndexSize
+        if ($assemblyFlags -ne 0 -or $publicKeyIndex -ne 0 -or $assemblyCultureIndex -ne 0) {
+            throw 'TinyHwBar assembly must be unsigned, neutral-culture, and use default assembly flags.'
+        }
+
+        $readString = {
+            param([long]$Index, [string]$Description)
+
+            if ($Index -le 0 -or $Index -ge $stringsStream.Size) {
+                throw "$Description has an invalid #Strings index."
+            }
+            [long]$stringOffset = $stringsStream.Offset + $Index
+            [long]$stringsEnd = $stringsStream.Offset + $stringsStream.Size
+            $stream.Position = $stringOffset
+            $bytes = New-Object Collections.Generic.List[byte]
+            $terminated = $false
+            while ($stream.Position -lt $stringsEnd -and $bytes.Count -le 1024) {
+                $value = $reader.ReadByte()
+                if ($value -eq 0) {
+                    $terminated = $true
+                    break
+                }
+                [void]$bytes.Add($value)
+            }
+            if (-not $terminated -or $bytes.Count -eq 0 -or $bytes.Count -gt 1024) {
+                throw "$Description is missing a bounded NUL terminator."
+            }
+            try {
+                $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+                $text = $strictUtf8.GetString($bytes.ToArray())
+            }
+            catch {
+                throw "$Description is not valid UTF-8."
+            }
+            return [pscustomobject]@{
+                Text = $text
+                Offset = $stringOffset
+                ByteLength = $bytes.Count
+            }
+        }
+        $assemblyName = & $readString $assemblyNameIndex 'CLI Assembly name'
+        $assemblyVersion = New-Object Version(
+            $assemblyMajor,
+            $assemblyMinor,
+            $assemblyBuild,
+            $assemblyRevision)
+        if (-not [string]::Equals(
+                $assemblyName.Text,
+                'TinyHwBar',
+                [StringComparison]::Ordinal) -or
+            $assemblyVersion -ne $ExpectedVersion) {
+            throw "TinyHwBar CLI Assembly identity does not match TinyHwBar $ExpectedVersion."
+        }
+
+        return [pscustomobject]@{
+            Name = $assemblyName.Text
+            Version = $assemblyVersion
+            Machine = $machine
+            OptionalHeaderMagic = 0x020B
+            Subsystem = $subsystem
+            Characteristics = $characteristics
+            ClrFlags = $clrFlags
+            ClrFlagsOffset = $clrFlagsOffset
+            MetadataRootOffset = $metadataOffset
+            AssemblyVersionOffset = $assemblyVersionOffset
+            AssemblyNameOffset = $assemblyName.Offset
+            AssemblyNameByteLength = $assemblyName.ByteLength
+        }
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Get-TinyHwBarExecutableMetadata {
+    param([string]$Path)
+
+    Assert-RegularFileOrMissing $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "TinyHwBar executable not found: $Path"
+    }
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not [string]::Equals($item.Extension, '.exe', [StringComparison]::OrdinalIgnoreCase) -or
+        $item.Length -lt 64) {
+        throw 'Source must be a non-empty Windows executable.'
+    }
+
+    $versionInfo = [Diagnostics.FileVersionInfo]::GetVersionInfo($item.FullName)
+    foreach ($identity in @(
+        [pscustomobject]@{ Name = 'ProductName'; Value = $versionInfo.ProductName; Expected = 'TinyHwBar' },
+        [pscustomobject]@{ Name = 'InternalName'; Value = $versionInfo.InternalName; Expected = 'TinyHwBar.exe' },
+        [pscustomobject]@{ Name = 'OriginalFilename'; Value = $versionInfo.OriginalFilename; Expected = 'TinyHwBar.exe' })) {
+        if (-not [string]::Equals(
+            [string]$identity.Value,
+            [string]$identity.Expected,
+            [StringComparison]::OrdinalIgnoreCase)) {
+            throw ("Source executable identity mismatch for $($identity.Name); " +
+                "expected '$($identity.Expected)'.")
+        }
+    }
+
+    $productVersionText = [string]$versionInfo.ProductVersion
+    $fileVersionText = [string]$versionInfo.FileVersion
+    $productVersion = $null
+    $fileVersion = $null
+    if ([string]::IsNullOrWhiteSpace($productVersionText) -or
+        -not [Version]::TryParse($productVersionText, [ref]$productVersion) -or
+        [string]::IsNullOrWhiteSpace($fileVersionText) -or
+        -not [Version]::TryParse($fileVersionText, [ref]$fileVersion)) {
+        throw 'Source executable has missing or invalid product/file version metadata.'
+    }
+    $canonicalProductVersion = '{0}.{1}.{2}' -f `
+        $productVersion.Major, $productVersion.Minor, $productVersion.Build
+    $canonicalFileVersion = '{0}.{1}.{2}.{3}' -f `
+        $fileVersion.Major, $fileVersion.Minor, $fileVersion.Build, $fileVersion.Revision
+    if ($productVersion.Revision -ne -1 -or
+        $fileVersion.Revision -ne 0 -or
+        -not [string]::Equals(
+            $productVersionText,
+            $canonicalProductVersion,
+            [StringComparison]::Ordinal) -or
+        -not [string]::Equals(
+            $fileVersionText,
+            $canonicalFileVersion,
+            [StringComparison]::Ordinal) -or
+        $productVersion.Major -ne $fileVersion.Major -or
+        $productVersion.Minor -ne $fileVersion.Minor -or
+        $productVersion.Build -ne $fileVersion.Build) {
+        throw 'Source executable product and file versions are inconsistent.'
+    }
+
+    [void](Get-TinyHwBarCliAssemblyMetadata $item.FullName $fileVersion)
+
+    return [pscustomobject]@{
+        FullName = $item.FullName
+        DisplayVersion = $canonicalProductVersion
+        FileVersion = $fileVersion
+    }
 }
 
 function Test-UninstallKeyOwned {
@@ -564,9 +1344,15 @@ function Restore-RegistryKeySnapshot {
 }
 
 function Copy-FileWithHashVerification {
-    param([string]$Source, [string]$Destination)
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [string]$ExpectedSourceHash)
 
     Assert-RegularFileOrMissing $Source
+    if ([string]::IsNullOrWhiteSpace($ExpectedSourceHash)) {
+        throw "The approved source does not have a trusted SHA-256 snapshot: $Source"
+    }
     $destinationParent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Destination))
     Assert-NotReparsePoint $destinationParent
     if (Test-Path -LiteralPath $Destination) {
@@ -574,16 +1360,22 @@ function Copy-FileWithHashVerification {
     }
 
     $sourceHashBefore = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+    if (-not [string]::Equals(
+        $sourceHashBefore,
+        $ExpectedSourceHash,
+        [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The approved source changed before staging: $Source"
+    }
     [IO.File]::Copy($Source, $Destination, $false)
     Assert-RegularFileOrMissing $Destination
     $sourceHashAfter = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
     $destinationHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
     if (-not [string]::Equals(
-        $sourceHashBefore,
+        $ExpectedSourceHash,
         $sourceHashAfter,
         [StringComparison]::OrdinalIgnoreCase) -or
         -not [string]::Equals(
-            $sourceHashBefore,
+            $ExpectedSourceHash,
             $destinationHash,
             [StringComparison]::OrdinalIgnoreCase)) {
         throw "The source changed or SHA-256 verification failed while staging: $Source"
@@ -890,6 +1682,9 @@ Assert-OwnedOrEmptyInstallDirectory $installRoot $markerPath $ownershipMarkerCon
 Assert-RegularFileOrMissing $destinationExe
 Assert-RegularFileOrMissing $destinationUninstaller
 
+$SourceExe = Get-ValidatedLocalFixedFilePath `
+    $SourceExe `
+    'TinyHwBar source executable'
 if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
     throw "TinyHwBar executable not found: $SourceExe"
 }
@@ -900,10 +1695,24 @@ if (-not (Test-Path -LiteralPath $powershellExe -PathType Leaf)) {
     throw "Windows PowerShell 5.1 was not found: $powershellExe"
 }
 
-$sourceItem = Get-Item -LiteralPath $SourceExe
-if ($sourceItem.Extension -ne '.exe' -or $sourceItem.Length -le 0) {
-    throw 'Source must be a non-empty .exe file.'
+$sourceItem = Get-Item -LiteralPath $SourceExe -Force
+$sourceExeHashBefore = (Get-FileHash -LiteralPath $sourceItem.FullName -Algorithm SHA256).Hash
+$sourceMetadata = Get-TinyHwBarExecutableMetadata $sourceItem.FullName
+$sourcePathAfterMetadata = Get-ValidatedLocalFixedFilePath `
+    $sourceItem.FullName `
+    'TinyHwBar source executable'
+$sourceExeHashAfter = (Get-FileHash -LiteralPath $sourcePathAfterMetadata -Algorithm SHA256).Hash
+if (-not (Test-PathEquals $sourcePathAfterMetadata $sourceItem.FullName) -or
+    -not [string]::Equals(
+        $sourceExeHashBefore,
+        $sourceExeHashAfter,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'TinyHwBar source executable changed while its identity was being validated.'
 }
+$sourceExeExpectedHash = $sourceExeHashAfter
+Assert-RegularFileOrMissing $sourceUninstaller
+$sourceUninstallerExpectedHash = (
+    Get-FileHash -LiteralPath $sourceUninstaller -Algorithm SHA256).Hash
 $displayVersion = $null
 $expectedUninstallCommand = '"' + $powershellExe + '" -NoProfile -ExecutionPolicy Bypass -File "' +
     $destinationUninstaller + '"'
@@ -1004,8 +1813,10 @@ $installCompleted = $false
 $registryModified = $false
 $maintenanceMutex = $null
 $maintenanceMutexAcquired = $false
-$singletonMutex = $null
-$singletonMutexAcquired = $false
+$appSingletonMutex = $null
+$appSingletonMutexAcquired = $false
+$legacySingletonMutex = $null
+$legacySingletonMutexAcquired = $false
 $exeState = $null
 $uninstallerState = $null
 $markerState = $null
@@ -1024,21 +1835,41 @@ try {
         throw 'Another TinyHwBar installation or uninstallation is active for this Windows user, possibly in another session. No installation artifacts were changed; retry after it finishes.'
     }
 
-    $singletonMutex = [Threading.Mutex]::new($false, $singletonMutexName)
+    $appSingletonMutex = [Threading.Mutex]::new($false, $appSingletonMutexName)
     try {
-        $singletonMutexAcquired = $singletonMutex.WaitOne(0, $false)
+        $appSingletonMutexAcquired = $appSingletonMutex.WaitOne(0, $false)
     }
     catch [Threading.AbandonedMutexException] {
-        $singletonMutexAcquired = $true
+        $appSingletonMutexAcquired = $true
     }
 
-    if (-not $singletonMutexAcquired) {
-        throw 'A current-session TinyHwBar instance is active. No installation artifacts were changed; exit TinyHwBar and retry.'
+    if (-not $appSingletonMutexAcquired) {
+        throw 'A TinyHwBar instance is active for this Windows user, possibly in another session. No installation artifacts were changed; exit every copy and retry.'
     }
 
-    $runningAfterMutexAcquisition = @(Get-CimInstance Win32_Process -Filter "Name = 'TinyHwBar.exe'")
-    if ($runningAfterMutexAcquisition.Count -ne 0) {
-        throw 'A normally named TinyHwBar process is running. No installation artifacts were changed; exit every installed or portable copy and retry.'
+    $legacySingletonMutex = [Threading.Mutex]::new($false, $legacySingletonMutexName)
+    try {
+        $legacySingletonMutexAcquired = $legacySingletonMutex.WaitOne(0, $false)
+    }
+    catch [Threading.AbandonedMutexException] {
+        $legacySingletonMutexAcquired = $true
+    }
+
+    if (-not $legacySingletonMutexAcquired) {
+        throw 'A legacy current-session TinyHwBar instance is active. No installation artifacts were changed; exit TinyHwBar and retry.'
+    }
+
+    $runningAfterMutexAcquisition = @(
+        Get-CimInstance Win32_Process -Filter "Name = 'TinyHwBar.exe'")
+    $postMutexProcessCheck = Get-TinyHwBarProcessBlockers `
+        $runningAfterMutexAcquisition `
+        $currentUserSid `
+        $destinationExe
+    Write-TinyHwBarProcessOwnerWarning $postMutexProcessCheck
+    if (@($postMutexProcessCheck.BlockingProcesses).Count -ne 0) {
+        throw ('A normally named TinyHwBar process for this Windows user, or a process using this ' +
+            'user''s installed TinyHwBar path, is running. No installation artifacts were changed; ' +
+            'exit every installed or portable copy for this Windows user and retry.')
     }
 
     Assert-NotReparsePoint $programsRoot
@@ -1138,15 +1969,35 @@ try {
     }
     else { $null }
 
-    $stagedExeExpectedHash = Copy-FileWithHashVerification $sourceItem.FullName $stagedExe
+    $sourcePathAtStaging = Get-ValidatedLocalFixedFilePath `
+        $sourceItem.FullName `
+        'TinyHwBar source executable'
+    if (-not (Test-PathEquals $sourcePathAtStaging $sourceItem.FullName)) {
+        throw 'TinyHwBar source executable path changed before staging.'
+    }
+    $stagedExeExpectedHash = Copy-FileWithHashVerification `
+        $sourcePathAtStaging `
+        $stagedExe `
+        $sourceExeExpectedHash
     $stagedExeItem = Get-Item -LiteralPath $stagedExe
     if ($stagedExeItem.Length -le 0) {
         throw 'The staged TinyHwBar executable is empty.'
     }
-    $displayVersion = Get-ExecutableDisplayVersion $stagedExe
+    $stagedMetadata = Get-TinyHwBarExecutableMetadata $stagedExe
+    if (-not [string]::Equals(
+        $sourceMetadata.DisplayVersion,
+        $stagedMetadata.DisplayVersion,
+        [StringComparison]::Ordinal) -or
+        $sourceMetadata.FileVersion -ne $stagedMetadata.FileVersion) {
+        throw 'The staged executable metadata does not match the validated source executable.'
+    }
+    $displayVersion = $stagedMetadata.DisplayVersion
     Assert-FileHashMatchesExpected $stagedExe $stagedExeExpectedHash 'Staged executable'
     $stagedUninstallerExpectedHash =
-        Copy-FileWithHashVerification $sourceUninstaller $stagedUninstaller
+        Copy-FileWithHashVerification `
+            $sourceUninstaller `
+            $stagedUninstaller `
+            $sourceUninstallerExpectedHash
     $stagedUninstallerItem = Get-Item -LiteralPath $stagedUninstaller
     if ($stagedUninstallerItem.Length -le 0) {
         throw 'The staged TinyHwBar uninstaller is empty.'
@@ -1377,14 +2228,24 @@ finally {
         }
     }
     finally {
-        if ($null -ne $singletonMutex) {
+        if ($null -ne $legacySingletonMutex) {
             try {
-                if ($singletonMutexAcquired) {
-                    $singletonMutex.ReleaseMutex()
+                if ($legacySingletonMutexAcquired) {
+                    $legacySingletonMutex.ReleaseMutex()
                 }
             }
             finally {
-                $singletonMutex.Dispose()
+                $legacySingletonMutex.Dispose()
+            }
+        }
+        if ($null -ne $appSingletonMutex) {
+            try {
+                if ($appSingletonMutexAcquired) {
+                    $appSingletonMutex.ReleaseMutex()
+                }
+            }
+            finally {
+                $appSingletonMutex.Dispose()
             }
         }
         if ($null -ne $maintenanceMutex) {

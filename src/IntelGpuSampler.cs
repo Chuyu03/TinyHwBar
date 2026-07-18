@@ -37,11 +37,41 @@ namespace TinyHwBar
         Integrated
     }
 
+    internal sealed class GpuAdapterChoice
+    {
+        internal GpuAdapterChoice(
+            string adapterId,
+            string name,
+            uint vendorId,
+            GpuAdapterRole role)
+        {
+            AdapterId = adapterId ?? string.Empty;
+            Name = name ?? string.Empty;
+            VendorId = vendorId;
+            Role = role;
+        }
+
+        internal string AdapterId { get; private set; }
+        internal string Name { get; private set; }
+        internal uint VendorId { get; private set; }
+        internal GpuAdapterRole Role { get; private set; }
+
+        public override string ToString()
+        {
+            string roleText = Role == GpuAdapterRole.Discrete
+                ? "独立显卡"
+                : "核显";
+            return (string.IsNullOrWhiteSpace(Name) ? "未命名 GPU" : Name) +
+                "（" + roleText + "）";
+        }
+    }
+
     internal sealed class IntelGpuMetrics
     {
         internal bool IsAvailable { get; private set; }
         internal bool PerformanceDataAvailable { get; private set; }
         internal string AdapterName { get; private set; }
+        internal string AdapterId { get; private set; }
         internal uint? AdapterVendorId { get; private set; }
         internal GpuAdapterRole AdapterRole { get; private set; }
         internal uint? AdapterLuidLowPart { get; private set; }
@@ -56,6 +86,7 @@ namespace TinyHwBar
         internal IntelGpuDataStatus UtilizationStatus { get; private set; }
         internal IntelGpuDataStatus MemoryStatus { get; private set; }
         internal IntelGpuDataStatus TemperatureStatus { get; private set; }
+        internal bool PreferredSelectionMatched { get; private set; }
 
         internal static IntelGpuMetrics CreateUnavailable()
         {
@@ -79,6 +110,7 @@ namespace TinyHwBar
                 IsAvailable = false,
                 PerformanceDataAvailable = false,
                 AdapterName = string.Empty,
+                AdapterId = string.Empty,
                 AdapterVendorId = null,
                 AdapterRole = adapterRole,
                 AdapterLuidLowPart = null,
@@ -164,6 +196,9 @@ namespace TinyHwBar
                     utilizationStatus == IntelGpuDataStatus.Available ||
                     memoryStatus == IntelGpuDataStatus.Available,
                 AdapterName = adapterName ?? string.Empty,
+                AdapterId = GpuRoleSampler.BuildAdapterId(
+                    adapterLuidLowPart,
+                    adapterLuidHighPart),
                 AdapterVendorId = adapterVendorId,
                 AdapterRole = adapterRole,
                 AdapterLuidLowPart = adapterLuidLowPart,
@@ -188,6 +223,7 @@ namespace TinyHwBar
                 IsAvailable = IsAvailable,
                 PerformanceDataAvailable = PerformanceDataAvailable,
                 AdapterName = AdapterName,
+                AdapterId = AdapterId,
                 AdapterVendorId = AdapterVendorId,
                 AdapterRole = AdapterRole,
                 AdapterLuidLowPart = AdapterLuidLowPart,
@@ -201,8 +237,14 @@ namespace TinyHwBar
                 AdapterStatus = AdapterStatus,
                 UtilizationStatus = UtilizationStatus,
                 MemoryStatus = MemoryStatus,
-                TemperatureStatus = TemperatureStatus
+                TemperatureStatus = TemperatureStatus,
+                PreferredSelectionMatched = PreferredSelectionMatched
             };
+        }
+
+        internal void SetPreferredSelectionMatched(bool matched)
+        {
+            PreferredSelectionMatched = matched;
         }
     }
 
@@ -239,6 +281,9 @@ namespace TinyHwBar
         internal const uint DxgiAdapterFlagSoftware = 0x2;
         private const int DxgiErrorNotFound = unchecked((int)0x887A0002);
         private const int AccessDeniedHResult = unchecked((int)0x80070005);
+        private const uint DisplayConfigDeviceInfoGetAdapterName = 4;
+        private const int ErrorSuccess = 0;
+        private const int AdapterDevicePathChars = 128;
         private const uint DxCoreAdapterPropertyIsHardware = 11;
         private const uint DxCoreAdapterPropertyIsIntegrated = 12;
         private const string GpuEngineCategoryName = "GPU Engine";
@@ -257,6 +302,8 @@ namespace TinyHwBar
             new Dictionary<string, CounterSample>(StringComparer.OrdinalIgnoreCase);
 
         private bool disposed;
+        private string preferredAdapterId = string.Empty;
+        private string preferredAdapterName = string.Empty;
         private DateTime nextProbeUtc = DateTime.MinValue;
         private AdapterProbeResult cachedAdapterProbe =
             AdapterProbeResult.CreateUnavailable(IntelGpuDataStatus.NotFound);
@@ -280,7 +327,10 @@ namespace TinyHwBar
                 DateTime now = DateTime.UtcNow;
                 if (now >= nextProbeUtc)
                 {
-                    AdapterProbeResult discoveredAdapter = DiscoverAdapter(role);
+                    AdapterProbeResult discoveredAdapter = DiscoverAdapter(
+                        role,
+                        preferredAdapterId,
+                        preferredAdapterName);
                     if (!IsSameAdapter(cachedAdapterProbe, discoveredAdapter))
                     {
                         previousEngineSamples.Clear();
@@ -301,7 +351,7 @@ namespace TinyHwBar
                 UtilizationSample utilization = SampleUtilization(adapter);
                 MemorySample memory = SampleMemory(adapter);
 
-                return IntelGpuMetrics.CreateSampled(
+                IntelGpuMetrics metrics = IntelGpuMetrics.CreateSampled(
                     adapter.Name,
                     adapter.VendorId,
                     role,
@@ -314,6 +364,9 @@ namespace TinyHwBar
                     adapter.SharedMemoryLimitBytes,
                     utilization.Status,
                     memory.Status);
+                metrics.SetPreferredSelectionMatched(
+                    cachedAdapterProbe.PreferredSelectionMatched);
+                return metrics;
             }
         }
 
@@ -582,7 +635,22 @@ namespace TinyHwBar
             return IntelGpuDataStatus.Available;
         }
 
-        private static AdapterProbeResult DiscoverAdapter(GpuAdapterRole role)
+        private static AdapterProbeResult DiscoverAdapter(
+            GpuAdapterRole role,
+            string preferredAdapterId,
+            string preferredAdapterName)
+        {
+            AdapterEnumerationResult enumeration = EnumerateAdapters();
+            return enumeration.Status == IntelGpuDataStatus.Available
+                ? SelectAdapter(
+                    enumeration.Adapters,
+                    role,
+                    preferredAdapterId,
+                    preferredAdapterName)
+                : AdapterProbeResult.CreateUnavailable(enumeration.Status);
+        }
+
+        private static AdapterEnumerationResult EnumerateAdapters()
         {
             IDXGIFactory1 factory = null;
             List<GpuAdapterInfo> candidates = new List<GpuAdapterInfo>();
@@ -598,7 +666,7 @@ namespace TinyHwBar
 
                 if (createResult < 0 || factory == null)
                 {
-                    return AdapterProbeResult.CreateUnavailable(
+                    return AdapterEnumerationResult.CreateUnavailable(
                         createResult == AccessDeniedHResult
                             ? IntelGpuDataStatus.AccessDenied
                             : IntelGpuDataStatus.ProbeFailed);
@@ -618,7 +686,7 @@ namespace TinyHwBar
 
                         if (enumerateResult < 0 || adapter == null)
                         {
-                            return AdapterProbeResult.CreateUnavailable(
+                            return AdapterEnumerationResult.CreateUnavailable(
                                 enumerateResult == AccessDeniedHResult
                                     ? IntelGpuDataStatus.AccessDenied
                                     : IntelGpuDataStatus.ProbeFailed);
@@ -628,7 +696,7 @@ namespace TinyHwBar
                         int descriptionResult = adapter.GetDesc1(out description);
                         if (descriptionResult < 0)
                         {
-                            return AdapterProbeResult.CreateUnavailable(
+                            return AdapterEnumerationResult.CreateUnavailable(
                                 descriptionResult == AccessDeniedHResult
                                     ? IntelGpuDataStatus.AccessDenied
                                     : IntelGpuDataStatus.ProbeFailed);
@@ -641,6 +709,25 @@ namespace TinyHwBar
                             continue;
                         }
 
+                        GpuAdapterInfo candidate = new GpuAdapterInfo(
+                            description.Description == null
+                                ? string.Empty
+                                : description.Description.TrimEnd('\0').Trim(),
+                            description.VendorId,
+                            description.AdapterLuid.LowPart,
+                            description.AdapterLuid.HighPart,
+                            ToNullableInt64(description.DedicatedVideoMemory),
+                            ToNullableInt64(description.SharedSystemMemory));
+                        string adapterDevicePath;
+                        if (TryGetAdapterDevicePath(
+                                candidate.LuidLowPart,
+                                candidate.LuidHighPart,
+                                out adapterDevicePath) &&
+                            IsRootEnumeratedDisplayDevicePath(adapterDevicePath))
+                        {
+                            continue;
+                        }
+
                         if (!TryRegisterAdapterLuid(
                                 seenAdapterLuids,
                                 description.AdapterLuid.LowPart,
@@ -649,16 +736,7 @@ namespace TinyHwBar
                             continue;
                         }
 
-                        candidates.Add(
-                            new GpuAdapterInfo(
-                                description.Description == null
-                                    ? string.Empty
-                                    : description.Description.TrimEnd('\0').Trim(),
-                                description.VendorId,
-                                description.AdapterLuid.LowPart,
-                                description.AdapterLuid.HighPart,
-                                ToNullableInt64(description.DedicatedVideoMemory),
-                                ToNullableInt64(description.SharedSystemMemory)));
+                        candidates.Add(candidate);
                     }
                     finally
                     {
@@ -668,17 +746,17 @@ namespace TinyHwBar
             }
             catch (UnauthorizedAccessException)
             {
-                return AdapterProbeResult.CreateUnavailable(
+                return AdapterEnumerationResult.CreateUnavailable(
                     IntelGpuDataStatus.AccessDenied);
             }
             catch (SecurityException)
             {
-                return AdapterProbeResult.CreateUnavailable(
+                return AdapterEnumerationResult.CreateUnavailable(
                     IntelGpuDataStatus.AccessDenied);
             }
             catch (Exception)
             {
-                return AdapterProbeResult.CreateUnavailable(
+                return AdapterEnumerationResult.CreateUnavailable(
                     IntelGpuDataStatus.ProbeFailed);
             }
             finally
@@ -686,12 +764,213 @@ namespace TinyHwBar
                 ReleaseComObject(factory);
             }
 
-            return SelectAdapter(candidates, role);
+            return candidates.Count == 0
+                ? AdapterEnumerationResult.CreateUnavailable(
+                    IntelGpuDataStatus.NotFound)
+                : AdapterEnumerationResult.CreateAvailable(candidates);
+        }
+
+        private static bool TryGetAdapterDevicePath(
+            uint luidLowPart,
+            int luidHighPart,
+            out string adapterDevicePath)
+        {
+            adapterDevicePath = string.Empty;
+            DisplayConfigAdapterName request = new DisplayConfigAdapterName
+            {
+                Header = new DisplayConfigDeviceInfoHeader
+                {
+                    Type = DisplayConfigDeviceInfoGetAdapterName,
+                    Size = (uint)Marshal.SizeOf(typeof(DisplayConfigAdapterName)),
+                    AdapterId = new LocallyUniqueIdentifier
+                    {
+                        LowPart = luidLowPart,
+                        HighPart = luidHighPart
+                    },
+                    Id = 0
+                },
+                AdapterDevicePath = string.Empty
+            };
+
+            try
+            {
+                if (DisplayConfigGetDeviceInfo(ref request) != ErrorSuccess ||
+                    string.IsNullOrWhiteSpace(request.AdapterDevicePath))
+                {
+                    return false;
+                }
+
+                adapterDevicePath = request.AdapterDevicePath.Trim();
+                return true;
+            }
+            catch (Exception)
+            {
+                // A device-path lookup failure must retain the candidate so
+                // the normal ambiguity handling can fail closed.
+                return false;
+            }
+        }
+
+        internal static bool IsRootEnumeratedDisplayDevicePath(string devicePath)
+        {
+            if (string.IsNullOrWhiteSpace(devicePath))
+            {
+                return false;
+            }
+
+            string normalized = devicePath.Trim();
+            const string Win32DevicePrefix = @"\\?\";
+            if (normalized.StartsWith(
+                    Win32DevicePrefix,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized.Substring(Win32DevicePrefix.Length);
+            }
+
+            return normalized.StartsWith(
+                "ROOT#DISPLAY#",
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal void SetPreferredAdapterId(string adapterId)
+        {
+            SetPreferredAdapter(adapterId, string.Empty);
+        }
+
+        internal void SetPreferredAdapter(string adapterId, string adapterName)
+        {
+            lock (synchronization)
+            {
+                if (disposed)
+                {
+                    return;
+                }
+
+                string normalizedAdapterId = adapterId == null
+                    ? string.Empty
+                    : adapterId.Trim();
+                string normalizedAdapterName = adapterName == null
+                    ? string.Empty
+                    : adapterName.Trim();
+                if (string.Equals(
+                        preferredAdapterId,
+                        normalizedAdapterId,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(
+                        preferredAdapterName,
+                        normalizedAdapterName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                preferredAdapterId = normalizedAdapterId;
+                preferredAdapterName = normalizedAdapterName;
+                nextProbeUtc = DateTime.MinValue;
+                cachedAdapterProbe = AdapterProbeResult.CreateUnavailable(
+                    IntelGpuDataStatus.NotFound);
+                previousEngineSamples.Clear();
+            }
+        }
+
+        internal static GpuAdapterChoice[] GetAdapterChoices()
+        {
+            AdapterEnumerationResult enumeration = EnumerateAdapters();
+            if (enumeration.Status != IntelGpuDataStatus.Available ||
+                enumeration.Adapters.Count == 0)
+            {
+                return new GpuAdapterChoice[0];
+            }
+
+            IDXCoreAdapterFactory factory = null;
+            try
+            {
+                Guid factoryInterfaceId = typeof(IDXCoreAdapterFactory).GUID;
+                int createResult = DXCoreCreateAdapterFactory(
+                    ref factoryInterfaceId,
+                    out factory);
+                if (createResult < 0 || factory == null)
+                {
+                    return new GpuAdapterChoice[0];
+                }
+
+                List<GpuAdapterChoice> choices = new List<GpuAdapterChoice>();
+                foreach (GpuAdapterInfo adapter in enumeration.Adapters)
+                {
+                    DxCoreAdapterTraits traits = QueryAdapterTraits(factory, adapter);
+                    if (!ShouldIncludeHardwareCandidate(traits.IsHardware) ||
+                        traits.IntegrationKind == IntelAdapterIntegrationKind.Unknown)
+                    {
+                        continue;
+                    }
+
+                    GpuAdapterRole adapterRole = traits.IntegrationKind ==
+                        IntelAdapterIntegrationKind.Integrated
+                        ? GpuAdapterRole.Integrated
+                        : GpuAdapterRole.Discrete;
+                    choices.Add(
+                        new GpuAdapterChoice(
+                            adapter.AdapterId,
+                            adapter.Name,
+                            adapter.VendorId,
+                            adapterRole));
+                }
+
+                choices.Sort(CompareAdapterChoices);
+                return choices.ToArray();
+            }
+            catch (Exception)
+            {
+                return new GpuAdapterChoice[0];
+            }
+            finally
+            {
+                ReleaseComObject(factory);
+            }
+        }
+
+        internal static int CompareAdapterChoices(
+            GpuAdapterChoice left,
+            GpuAdapterChoice right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+
+            if (left == null)
+            {
+                return 1;
+            }
+
+            if (right == null)
+            {
+                return -1;
+            }
+
+            int roleComparison = left.Role.CompareTo(right.Role);
+            if (roleComparison != 0)
+            {
+                return roleComparison;
+            }
+
+            int nameComparison = string.Compare(
+                left.Name,
+                right.Name,
+                StringComparison.CurrentCultureIgnoreCase);
+            return nameComparison != 0
+                ? nameComparison
+                : string.Compare(
+                    left.AdapterId,
+                    right.AdapterId,
+                    StringComparison.OrdinalIgnoreCase);
         }
 
         private static AdapterProbeResult SelectAdapter(
             IList<GpuAdapterInfo> candidates,
-            GpuAdapterRole role)
+            GpuAdapterRole role,
+            string preferredAdapterId,
+            string preferredAdapterName)
         {
             if (candidates == null || candidates.Count == 0)
             {
@@ -716,7 +995,11 @@ namespace TinyHwBar
                     new List<GpuAdapterInfo>();
                 List<DxCoreAdapterTraits> hardwareTraits =
                     new List<DxCoreAdapterTraits>();
-                GpuAdapterInfo selectedAdapter = null;
+                List<GpuAdapterInfo> roleCandidates =
+                    new List<GpuAdapterInfo>();
+                GpuAdapterInfo preferredAdapter = null;
+                GpuAdapterInfo preferredNameAdapter = null;
+                int preferredNameMatchCount = 0;
 
                 for (int index = 0; index < candidates.Count; index++)
                 {
@@ -736,29 +1019,59 @@ namespace TinyHwBar
                     new List<IntelAdapterIntegrationKind>();
                 for (int index = 0; index < hardwareCandidates.Count; index++)
                 {
-                    if (hardwareTraits[index].IntegrationKind ==
-                            IntelAdapterIntegrationKind.Unknown &&
-                        HasClassifiedIdentityMatch(
-                            hardwareCandidates,
-                            hardwareTraits,
-                            index))
-                    {
-                        continue;
-                    }
-
                     kinds.Add(hardwareTraits[index].IntegrationKind);
                     if (IsTargetRole(role, hardwareTraits[index].IntegrationKind))
                     {
-                        selectedAdapter = hardwareCandidates[index];
+                        GpuAdapterInfo roleCandidate = hardwareCandidates[index];
+                        roleCandidates.Add(roleCandidate);
+                        if (!string.IsNullOrWhiteSpace(preferredAdapterId) &&
+                            string.Equals(
+                                roleCandidate.AdapterId,
+                                preferredAdapterId.Trim(),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            preferredAdapter = roleCandidate;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(preferredAdapterName) &&
+                            string.Equals(
+                                roleCandidate.Name,
+                                preferredAdapterName.Trim(),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            preferredNameAdapter = roleCandidate;
+                            preferredNameMatchCount++;
+                        }
                     }
                 }
 
-                IntelGpuDataStatus status = ResolveRoleStatus(
+                if (preferredAdapter != null)
+                {
+                    return AdapterProbeResult.CreateAvailable(
+                        preferredAdapter,
+                        true);
+                }
+
+                IntelGpuDataStatus status = ResolveAutomaticSelectionStatus(
                     role,
-                    kinds.ToArray());
-                return status == IntelGpuDataStatus.Available && selectedAdapter != null
-                    ? AdapterProbeResult.CreateAvailable(selectedAdapter)
-                    : AdapterProbeResult.CreateUnavailable(status);
+                    kinds.ToArray(),
+                    roleCandidates.Count);
+                if (status == IntelGpuDataStatus.Available)
+                {
+                    if (preferredNameMatchCount == 1 &&
+                        preferredNameAdapter != null)
+                    {
+                        return AdapterProbeResult.CreateAvailable(
+                            preferredNameAdapter,
+                            true);
+                    }
+
+                    return AdapterProbeResult.CreateAvailable(
+                        roleCandidates[0],
+                        false);
+                }
+
+                return AdapterProbeResult.CreateUnavailable(status);
             }
             catch (DllNotFoundException)
             {
@@ -789,59 +1102,6 @@ namespace TinyHwBar
             {
                 ReleaseComObject(factory);
             }
-        }
-
-        private static bool HasClassifiedIdentityMatch(
-            IList<GpuAdapterInfo> candidates,
-            IList<DxCoreAdapterTraits> traits,
-            int unknownIndex)
-        {
-            for (int index = 0; index < candidates.Count; index++)
-            {
-                if (index == unknownIndex ||
-                    traits[index].IntegrationKind == IntelAdapterIntegrationKind.Unknown)
-                {
-                    continue;
-                }
-
-                if (IsSameReportedAdapterIdentity(
-                        candidates[unknownIndex].Name,
-                        candidates[unknownIndex].VendorId,
-                        candidates[unknownIndex].LuidLowPart,
-                        candidates[unknownIndex].LuidHighPart,
-                        candidates[index].Name,
-                        candidates[index].VendorId,
-                        candidates[index].LuidLowPart,
-                        candidates[index].LuidHighPart))
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        internal static bool IsSameReportedAdapterIdentity(
-            string firstName,
-            uint firstVendorId,
-            uint firstLuidLowPart,
-            int firstLuidHighPart,
-            string secondName,
-            uint secondVendorId,
-            uint secondLuidLowPart,
-            int secondLuidHighPart)
-        {
-            // Vendor and model text can collide across real adapters. Only an
-            // exact LUID match is strong enough to suppress an unknown entry.
-            return firstVendorId == secondVendorId &&
-                firstLuidLowPart == secondLuidLowPart &&
-                firstLuidHighPart == secondLuidHighPart &&
-                !string.IsNullOrWhiteSpace(firstName) &&
-                !string.IsNullOrWhiteSpace(secondName) &&
-                string.Equals(
-                    firstName.Trim(),
-                    secondName.Trim(),
-                    StringComparison.OrdinalIgnoreCase);
         }
 
         private static DxCoreAdapterTraits QueryAdapterTraits(
@@ -996,6 +1256,21 @@ namespace TinyHwBar
                 : IntelGpuDataStatus.AmbiguousAdapter;
         }
 
+        internal static IntelGpuDataStatus ResolveAutomaticSelectionStatus(
+            GpuAdapterRole role,
+            IntelAdapterIntegrationKind[] kinds,
+            int classifiedTargetCount)
+        {
+            IntelGpuDataStatus status = ResolveRoleStatus(role, kinds);
+            if (status == IntelGpuDataStatus.Available &&
+                classifiedTargetCount != 1)
+            {
+                return IntelGpuDataStatus.AmbiguousAdapter;
+            }
+
+            return status;
+        }
+
         private static bool IsTargetRole(
             GpuAdapterRole role,
             IntelAdapterIntegrationKind kind)
@@ -1064,13 +1339,18 @@ namespace TinyHwBar
                 lowPart);
         }
 
-        private static string BuildLuidKey(uint lowPart, int highPart)
+        internal static string BuildAdapterId(uint lowPart, int highPart)
         {
             return string.Format(
                 CultureInfo.InvariantCulture,
                 "{0:X8}:{1:X8}",
                 unchecked((uint)highPart),
                 lowPart);
+        }
+
+        private static string BuildLuidKey(uint lowPart, int highPart)
+        {
+            return BuildAdapterId(lowPart, highPart);
         }
 
         private static bool ContainsLuidToken(
@@ -1176,6 +1456,10 @@ namespace TinyHwBar
             }
 
             internal string Name { get; private set; }
+            internal string AdapterId
+            {
+                get { return BuildAdapterId(LuidLowPart, LuidHighPart); }
+            }
             internal uint VendorId { get; private set; }
             internal uint LuidLowPart { get; private set; }
             internal int LuidHighPart { get; private set; }
@@ -1190,31 +1474,72 @@ namespace TinyHwBar
             }
         }
 
+        private sealed class AdapterEnumerationResult
+        {
+            private AdapterEnumerationResult(
+                IntelGpuDataStatus status,
+                IList<GpuAdapterInfo> adapters)
+            {
+                Status = status;
+                Adapters = adapters ?? new List<GpuAdapterInfo>();
+            }
+
+            internal IntelGpuDataStatus Status { get; private set; }
+            internal IList<GpuAdapterInfo> Adapters { get; private set; }
+
+            internal static AdapterEnumerationResult CreateAvailable(
+                IList<GpuAdapterInfo> adapters)
+            {
+                return new AdapterEnumerationResult(
+                    IntelGpuDataStatus.Available,
+                    adapters);
+            }
+
+            internal static AdapterEnumerationResult CreateUnavailable(
+                IntelGpuDataStatus status)
+            {
+                return new AdapterEnumerationResult(
+                    status,
+                    new List<GpuAdapterInfo>());
+            }
+        }
+
         private sealed class AdapterProbeResult
         {
             private AdapterProbeResult(
                 IntelGpuDataStatus status,
-                GpuAdapterInfo adapter)
+                GpuAdapterInfo adapter,
+                bool preferredSelectionMatched)
             {
                 Status = status;
                 Adapter = adapter;
+                PreferredSelectionMatched = preferredSelectionMatched;
             }
 
             internal IntelGpuDataStatus Status { get; private set; }
             internal GpuAdapterInfo Adapter { get; private set; }
+            internal bool PreferredSelectionMatched { get; private set; }
 
             internal static AdapterProbeResult CreateAvailable(
                 GpuAdapterInfo adapter)
             {
+                return CreateAvailable(adapter, false);
+            }
+
+            internal static AdapterProbeResult CreateAvailable(
+                GpuAdapterInfo adapter,
+                bool preferredSelectionMatched)
+            {
                 return new AdapterProbeResult(
                     IntelGpuDataStatus.Available,
-                    adapter);
+                    adapter,
+                    preferredSelectionMatched);
             }
 
             internal static AdapterProbeResult CreateUnavailable(
                 IntelGpuDataStatus status)
             {
-                return new AdapterProbeResult(status, null);
+                return new AdapterProbeResult(status, null, false);
             }
         }
 
@@ -1298,6 +1623,11 @@ namespace TinyHwBar
                 return new MemorySample(status, null, null);
             }
         }
+
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [DllImport("user32.dll", ExactSpelling = true, SetLastError = false)]
+        private static extern int DisplayConfigGetDeviceInfo(
+            ref DisplayConfigAdapterName requestPacket);
 
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [DllImport("dxgi.dll", ExactSpelling = true)]
@@ -1436,6 +1766,24 @@ namespace TinyHwBar
         {
             internal uint LowPart;
             internal int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct DisplayConfigDeviceInfoHeader
+        {
+            internal uint Type;
+            internal uint Size;
+            internal LocallyUniqueIdentifier AdapterId;
+            internal uint Id;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct DisplayConfigAdapterName
+        {
+            internal DisplayConfigDeviceInfoHeader Header;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = AdapterDevicePathChars)]
+            internal string AdapterDevicePath;
         }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

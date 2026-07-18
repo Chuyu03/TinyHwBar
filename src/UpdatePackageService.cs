@@ -47,6 +47,8 @@ namespace TinyHwBar
 
     internal sealed class HttpWebRequestUpdatePackageTransport : IUpdatePackageTransport
     {
+        internal const string UserAgentValue = "TinyHwBar/3 update-package";
+
         private readonly IEndpointAddressResolver addressResolver;
 
         internal HttpWebRequestUpdatePackageTransport()
@@ -89,7 +91,7 @@ namespace TinyHwBar
             request.UseDefaultCredentials = false;
             request.Credentials = null;
             request.PreAuthenticate = false;
-            request.UserAgent = "TinyHwBar/2 update-package";
+            request.UserAgent = UserAgentValue;
             request.Headers[HttpRequestHeader.AcceptEncoding] = "identity";
 
             HttpWebResponse response = null;

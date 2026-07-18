@@ -6,7 +6,10 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -30,21 +33,37 @@ namespace TinyHwBar.Tests
                 Run("settings v2 round trip", delegate { TestSettingsV2RoundTrip(temporaryRoot); });
                 Run("settings rejects unsafe endpoints", delegate { TestUnsafeEndpoints(temporaryRoot); });
                 Run("settings save reports failure", delegate { TestSettingsSaveFailure(temporaryRoot); });
+                Run("settings load failures protect source files", delegate { TestSettingsLoadProtection(temporaryRoot); });
                 Run("history ring buffer", TestHistoryRingBuffer);
+                Run("history persistence toggles preserve saved points", TestHistoryPersistenceToggles);
                 Run("history enforces 24 hour in-memory limit", TestHistoryMaximumAge);
                 Run("bounded persistent history", delegate { TestPersistentHistory(temporaryRoot); });
                 Run("GPU history schema compatibility", delegate { TestHistoryGpuSchemaCompatibility(temporaryRoot); });
                 Run("history save reports failure", delegate { TestHistorySaveFailure(temporaryRoot); });
                 Run("history rejects oversized files", delegate { TestOversizedHistory(temporaryRoot); });
+                Run("history load failures protect source files", delegate { TestHistoryLoadProtection(temporaryRoot); });
+                Run("history backup recovery remains non-destructive", delegate { TestHistoryBackupRecovery(temporaryRoot); });
+                Run("history protection warning preserves later save warnings", TestHistoryProtectionWarningGate);
+                Run("history points retain sampler timestamps", TestHistorySnapshotTimestamp);
+                Run("history chart uses real timestamps and gaps", TestHistoryChartTimeline);
                 Run("gateway sampler remains passive while disabled", TestGatewayDisabledBoundary);
+                Run("gateway probe interval survives target changes", TestGatewayGlobalProbeInterval);
                 Run("gateway target local-only policy", TestGatewayTargetPolicy);
                 Run("network route selection decisions", TestNetworkRouteSelection);
                 Run("Windows sockaddr layout", TestSockaddrLayout);
                 Run("GPU role adapter classification", TestGpuRoleClassification);
                 Run("GPU role snapshot mapping", TestGpuRoleSnapshotMapping);
+                Run("GPU automatic and manual selection decisions", TestGpuSelectionDecisions);
                 Run("loopback GPU status schema", TestLoopbackGpuStatusSchema);
+                Run("singleton mutex spans sessions per user", TestSingletonMutexName);
+                Run("singleton mutex SID and ACL fail closed", TestSingletonMutexSecurity);
+                Run("singleton mutex blocks legacy and current instances", TestSingletonMutexCompatibility);
                 Run("display bounds include taskbar-reserved space", TestDisplayBoundsPositioning);
+                Run("dashboard fits inside the working area", TestDashboardWorkingAreaConstraint);
                 Run("dashboard defaults and accessibility structure", TestDashboardStructure);
+                Run("telemetry text rendering avoids RGB fringes", TestTelemetryTextRendering);
+                Run("dashboard preserves only dirty settings", TestDashboardDirtySettingsPreserved);
+                Run("dashboard retains a missing manual GPU choice", TestDashboardMissingManualGpuFallback);
                 Run("dashboard GPU values remain primary", TestDashboardGpuInformationHierarchy);
                 Run("advanced service boundaries", V2ServiceTests.RunAll);
             }
@@ -98,6 +117,10 @@ namespace TinyHwBar.Tests
             Assert(settings.OpacityPercent == 70, "v1 opacity changed");
             Assert(settings.PersistHistory, "history should default on during migration");
             Assert(settings.GatewayLatencyEnabled, "gateway latency should default on during migration");
+            Assert(
+                settings.GpuSelectionMode == GpuSelectionMode.Automatic &&
+                settings.SelectedGpuAdapterId.Length == 0,
+                "v1 settings did not migrate to automatic GPU selection");
             Assert(!settings.StartupEnabled, "startup must default off");
             Assert(!settings.AutomaticUpdateEnabled, "automatic update must default off");
             Assert(settings.UpdateManifestUrl.Length == 0, "v1 update endpoint was retained");
@@ -118,6 +141,9 @@ namespace TinyHwBar.Tests
             settings.OpacityPercent = 60;
             settings.PersistHistory = false;
             settings.GatewayLatencyEnabled = false;
+            settings.GpuSelectionMode = GpuSelectionMode.Manual;
+            settings.SelectedGpuAdapterId = "00000001:00000002";
+            settings.SelectedGpuAdapterName = "Test Discrete GPU";
             settings.StartupEnabled = true;
             settings.AutomaticUpdateEnabled = true;
             settings.UpdateManifestUrl = "https://example.com/tinyhwbar/manifest.json";
@@ -132,6 +158,11 @@ namespace TinyHwBar.Tests
             Assert(loaded.Locked && loaded.ClickThrough, "v2 flags changed");
             Assert(loaded.OpacityPercent == 60, "v2 opacity changed");
             Assert(!loaded.PersistHistory && !loaded.GatewayLatencyEnabled, "local options changed");
+            Assert(
+                loaded.GpuSelectionMode == GpuSelectionMode.Manual &&
+                loaded.SelectedGpuAdapterId == "00000001:00000002" &&
+                loaded.SelectedGpuAdapterName == "Test Discrete GPU",
+                "manual GPU selection did not round trip");
             Assert(loaded.StartupEnabled, "explicit startup setting was lost");
             Assert(loaded.AutomaticUpdateEnabled, "valid explicit update configuration was lost");
             Assert(
@@ -182,6 +213,237 @@ namespace TinyHwBar.Tests
                 !SettingsStore.Save(settings, invalidPath),
                 "path below an existing file was reported as saved");
             Assert(!File.Exists(invalidPath), "failed save left an unexpected settings file");
+
+            string protectedPath = Path.Combine(
+                temporaryRoot,
+                "settings-replace-failure.ini");
+            AppSettings first = AppSettings.CreateDefault();
+            first.OpacityPercent = 80;
+            Assert(SettingsStore.Save(first, protectedPath), "first backup fixture save failed");
+            AppSettings second = AppSettings.CreateDefault();
+            second.OpacityPercent = 70;
+            Assert(SettingsStore.Save(second, protectedPath), "second backup fixture save failed");
+            AppSettings third = AppSettings.CreateDefault();
+            third.OpacityPercent = 60;
+            Assert(
+                SettingsStore.Save(third, protectedPath),
+                "settings save could not rotate an existing backup");
+            string protectedBackupPath = protectedPath + ".bak";
+            string protectedBackupBytes = Convert.ToBase64String(
+                File.ReadAllBytes(protectedBackupPath));
+            File.SetAttributes(
+                protectedPath,
+                File.GetAttributes(protectedPath) | FileAttributes.ReadOnly);
+            try
+            {
+                AppSettings replacement = AppSettings.CreateDefault();
+                replacement.OpacityPercent = 50;
+                Assert(
+                    !SettingsStore.Save(replacement, protectedPath),
+                    "read-only primary settings were reported as replaced");
+                Assert(
+                    Convert.ToBase64String(File.ReadAllBytes(protectedBackupPath)) ==
+                        protectedBackupBytes,
+                    "failed settings replacement destroyed or changed the existing backup");
+            }
+            finally
+            {
+                File.SetAttributes(
+                    protectedPath,
+                    File.GetAttributes(protectedPath) & ~FileAttributes.ReadOnly);
+            }
+        }
+
+        private static void TestSettingsLoadProtection(string temporaryRoot)
+        {
+            string missingPath = Path.Combine(temporaryRoot, "settings-missing.ini");
+            SettingsLoadResult missing = SettingsStore.LoadWithStatus(missingPath);
+            Assert(missing.Status == SettingsLoadStatus.Missing, "missing settings status changed");
+            Assert(missing.AllowsAutomaticSave, "missing settings should allow first save");
+            Assert(
+                missing.Settings.GpuSelectionMode == GpuSelectionMode.Automatic,
+                "missing settings did not default to automatic GPU selection");
+            AppSettings missingSession = missing.CreateSessionSettings();
+            Assert(
+                missingSession.PersistHistory &&
+                missingSession.GatewayLatencyEnabled,
+                "fresh-install defaults were incorrectly treated as recovered side effects");
+            Assert(
+                SettingsStore.SaveAfterLoad(missing.Settings, missing, missingPath),
+                "first settings save after a missing file failed");
+            Assert(File.Exists(missingPath), "first settings save did not create the file");
+
+            string corruptPath = Path.Combine(temporaryRoot, "settings-corrupt.ini");
+            const string corruptContents = "this is not a settings file";
+            File.WriteAllText(corruptPath, corruptContents, Encoding.UTF8);
+            SettingsLoadResult corrupt = SettingsStore.LoadWithStatus(corruptPath);
+            Assert(corrupt.Status == SettingsLoadStatus.Corrupt, "corrupt settings status changed");
+            Assert(!corrupt.AllowsAutomaticSave, "corrupt settings were not write-protected");
+            Assert(
+                !SettingsStore.SaveAfterLoad(corrupt.Settings, corrupt, corruptPath),
+                "automatic save overwrote corrupt settings");
+            Assert(
+                File.ReadAllText(corruptPath, Encoding.UTF8) == corruptContents,
+                "corrupt settings contents changed after a blocked save");
+
+            string unsupportedPath = Path.Combine(temporaryRoot, "settings-unsupported.ini");
+            const string unsupportedContents = "Version=99\r\n";
+            File.WriteAllText(unsupportedPath, unsupportedContents, Encoding.UTF8);
+            SettingsLoadResult unsupported = SettingsStore.LoadWithStatus(unsupportedPath);
+            Assert(
+                unsupported.Status == SettingsLoadStatus.Unsupported,
+                "unsupported settings version was not distinguished from corruption");
+            Assert(!unsupported.AllowsAutomaticSave, "unsupported settings were not write-protected");
+            Assert(
+                !SettingsStore.SaveAfterLoad(
+                    unsupported.Settings,
+                    unsupported,
+                    unsupportedPath),
+                "automatic save overwrote unsupported settings");
+            Assert(
+                File.ReadAllText(unsupportedPath, Encoding.UTF8) == unsupportedContents,
+                "unsupported settings contents changed after a blocked save");
+
+            string unknownKeyPath = Path.Combine(temporaryRoot, "settings-unknown-key.ini");
+            Assert(
+                SettingsStore.Save(AppSettings.CreateDefault(), unknownKeyPath),
+                "unknown-key settings fixture save failed");
+            File.AppendAllText(unknownKeyPath, "FutureSetting=keep-me\r\n", Encoding.UTF8);
+            string unknownKeyContents = File.ReadAllText(unknownKeyPath, Encoding.UTF8);
+            SettingsLoadResult unknownKey = SettingsStore.LoadWithStatus(unknownKeyPath);
+            Assert(
+                unknownKey.Status == SettingsLoadStatus.Unsupported,
+                "unknown settings field was not protected as a future schema");
+            Assert(!unknownKey.AllowsAutomaticSave, "unknown settings field was not write-protected");
+            Assert(
+                !SettingsStore.SaveAfterLoad(unknownKey.Settings, unknownKey, unknownKeyPath),
+                "automatic save overwrote an unknown settings field");
+            Assert(
+                File.ReadAllText(unknownKeyPath, Encoding.UTF8) == unknownKeyContents,
+                "unknown settings field changed after a blocked save");
+
+            string invalidOptionalPath = Path.Combine(
+                temporaryRoot,
+                "settings-invalid-optional.ini");
+            Assert(
+                SettingsStore.Save(AppSettings.CreateDefault(), invalidOptionalPath),
+                "invalid-optional settings fixture save failed");
+            string invalidOptionalContents = File.ReadAllText(
+                invalidOptionalPath,
+                Encoding.UTF8).Replace(
+                    "GpuSelectionMode=Automatic",
+                    "GpuSelectionMode=Surprise");
+            File.WriteAllText(invalidOptionalPath, invalidOptionalContents, Encoding.UTF8);
+            SettingsLoadResult invalidOptional = SettingsStore.LoadWithStatus(
+                invalidOptionalPath);
+            Assert(
+                invalidOptional.Status == SettingsLoadStatus.Corrupt,
+                "invalid optional settings value was silently normalized");
+            Assert(
+                !invalidOptional.AllowsAutomaticSave,
+                "invalid optional settings value was not write-protected");
+            Assert(
+                !SettingsStore.SaveAfterLoad(
+                    invalidOptional.Settings,
+                    invalidOptional,
+                    invalidOptionalPath),
+                "automatic save overwrote an invalid optional settings value");
+            Assert(
+                File.ReadAllText(invalidOptionalPath, Encoding.UTF8) ==
+                    invalidOptionalContents,
+                "invalid optional settings value changed after a blocked save");
+
+            string ioFailurePath = Path.Combine(temporaryRoot, "settings-io-failure");
+            Directory.CreateDirectory(ioFailurePath);
+            SettingsLoadResult ioFailure = SettingsStore.LoadWithStatus(ioFailurePath);
+            Assert(ioFailure.Status == SettingsLoadStatus.IoFailure, "settings I/O failure was not reported");
+            Assert(!ioFailure.AllowsAutomaticSave, "settings I/O failure was not write-protected");
+
+            string recoveryPath = Path.Combine(temporaryRoot, "settings-recovery.ini");
+            AppSettings first = AppSettings.CreateDefault();
+            first.Left = 11;
+            Assert(SettingsStore.Save(first, recoveryPath), "first recovery settings save failed");
+            AppSettings second = AppSettings.CreateDefault();
+            second.Left = 22;
+            Assert(SettingsStore.Save(second, recoveryPath), "second recovery settings save failed");
+            Assert(File.Exists(recoveryPath + ".bak"), "settings backup was not retained");
+            const string damagedPrimaryContents = "Version=2\r\nLeft=not-an-integer\r\n";
+            File.WriteAllText(recoveryPath, damagedPrimaryContents, Encoding.UTF8);
+
+            SettingsLoadResult recovered = SettingsStore.LoadWithStatus(recoveryPath);
+            Assert(recovered.Status == SettingsLoadStatus.Corrupt, "damaged primary status changed");
+            Assert(recovered.LoadedFromBackup, "valid settings backup was not loaded");
+            Assert(
+                recovered.BackupStatus == SettingsLoadStatus.Success,
+                "settings backup success was not reported");
+            Assert(recovered.Settings.Left == 11, "recovered settings did not come from the backup");
+            Assert(!recovered.AllowsAutomaticSave, "backup recovery allowed destructive automatic save");
+            Assert(
+                !SettingsStore.SaveAfterLoad(recovered.Settings, recovered, recoveryPath),
+                "automatic save replaced a damaged primary after backup recovery");
+            Assert(
+                File.ReadAllText(recoveryPath, Encoding.UTF8) == damagedPrimaryContents,
+                "damaged primary changed after non-destructive backup recovery");
+
+            recovered.Settings.PersistHistory = true;
+            recovered.Settings.GatewayLatencyEnabled = true;
+            recovered.Settings.AutomaticUpdateEnabled = true;
+            recovered.Settings.LoopbackApiEnabled = true;
+            recovered.Settings.TelemetryEnabled = true;
+            recovered.Settings.GpuSelectionMode = GpuSelectionMode.Manual;
+            recovered.Settings.SelectedGpuAdapterId = "luid:recovered";
+            recovered.Settings.UpdateManifestUrl = "https://updates.example.test/manifest.json";
+            recovered.Settings.TelemetryEndpoint = "https://telemetry.example.test/collect";
+            AppSettings recoveredSession = recovered.CreateSessionSettings();
+            Assert(
+                !recoveredSession.PersistHistory &&
+                !recoveredSession.GatewayLatencyEnabled &&
+                !recoveredSession.AutomaticUpdateEnabled &&
+                !recoveredSession.LoopbackApiEnabled &&
+                !recoveredSession.TelemetryEnabled,
+                "recovered settings silently re-enabled local or network side effects");
+            Assert(
+                recoveredSession.GpuSelectionMode == GpuSelectionMode.Manual &&
+                recoveredSession.SelectedGpuAdapterId == "luid:recovered" &&
+                recoveredSession.UpdateManifestUrl ==
+                    "https://updates.example.test/manifest.json" &&
+                recoveredSession.TelemetryEndpoint ==
+                    "https://telemetry.example.test/collect",
+                "fail-closed recovery discarded safe preferences or endpoint drafts");
+            Assert(
+                recovered.Settings.PersistHistory &&
+                recovered.Settings.GatewayLatencyEnabled &&
+                recovered.Settings.AutomaticUpdateEnabled &&
+                recovered.Settings.LoopbackApiEnabled &&
+                recovered.Settings.TelemetryEnabled,
+                "session safety mutated the protected backup settings");
+
+            string missingPrimaryPath = Path.Combine(
+                temporaryRoot,
+                "settings-missing-primary.ini");
+            AppSettings backupOnlySettings = AppSettings.CreateDefault();
+            backupOnlySettings.AutomaticUpdateEnabled = true;
+            backupOnlySettings.UpdateManifestUrl =
+                "https://updates.example.test/manifest.json";
+            Assert(
+                SettingsStore.Save(backupOnlySettings, missingPrimaryPath + ".bak"),
+                "backup-only settings fixture save failed");
+            SettingsLoadResult backupOnly = SettingsStore.LoadWithStatus(
+                missingPrimaryPath);
+            Assert(
+                backupOnly.Status == SettingsLoadStatus.Missing &&
+                backupOnly.LoadedFromBackup,
+                "missing primary did not report backup recovery");
+            Assert(
+                !backupOnly.AllowsAutomaticSave &&
+                backupOnly.NeedsUserAttention,
+                "backup-only recovery bypassed explicit review");
+            AppSettings backupOnlySession = backupOnly.CreateSessionSettings();
+            Assert(
+                !backupOnlySession.PersistHistory &&
+                !backupOnlySession.GatewayLatencyEnabled &&
+                !backupOnlySession.AutomaticUpdateEnabled,
+                "backup-only recovery silently re-enabled side effects");
         }
 
         private static void TestHistoryRingBuffer()
@@ -200,6 +462,49 @@ namespace TinyHwBar.Tests
 
             history.Clear();
             Assert(history.Count == 0 && history.Snapshot().Length == 0, "ring buffer did not clear");
+        }
+
+        private static void TestHistoryPersistenceToggles()
+        {
+            MetricHistory sessionHistory = new MetricHistory(10);
+            MetricHistory persistentHistory = new MetricHistory(10);
+            DateTime now = DateTime.UtcNow;
+
+            MonitorForm.AddHistoryPoint(
+                sessionHistory,
+                persistentHistory,
+                CreatePoint(now.AddSeconds(-5), 10),
+                true);
+            MonitorForm.AddHistoryPoint(
+                sessionHistory,
+                persistentHistory,
+                CreatePoint(now.AddSeconds(-4), 20),
+                false);
+            MonitorForm.AddHistoryPoint(
+                sessionHistory,
+                persistentHistory,
+                CreatePoint(now.AddSeconds(-3), 30),
+                true);
+            MonitorForm.AddHistoryPoint(
+                sessionHistory,
+                persistentHistory,
+                CreatePoint(now.AddSeconds(-2), 40),
+                false);
+            MonitorForm.AddHistoryPoint(
+                sessionHistory,
+                persistentHistory,
+                CreatePoint(now.AddSeconds(-1), 50),
+                true);
+
+            HistoryPoint[] sessionPoints = sessionHistory.Snapshot(now);
+            HistoryPoint[] persistentPoints = persistentHistory.Snapshot(now);
+            Assert(sessionPoints.Length == 5, "disabled persistence stopped the live history curve");
+            Assert(persistentPoints.Length == 3, "disabled intervals leaked into persistent history");
+            Assert(
+                persistentPoints[0].CpuPercent == 10 &&
+                persistentPoints[1].CpuPercent == 30 &&
+                persistentPoints[2].CpuPercent == 50,
+                "persistence toggles discarded old points or retained disabled-interval points");
         }
 
         private static void TestPersistentHistory(string temporaryRoot)
@@ -372,6 +677,51 @@ namespace TinyHwBar.Tests
                     temporaryRoot,
                     StringComparison.OrdinalIgnoreCase) < 0,
                 "history diagnostics exposed a local path");
+
+            string protectedPath = Path.Combine(
+                temporaryRoot,
+                "history-replace-failure.csv");
+            HistoryStore protectedStore = new HistoryStore(protectedPath);
+            DateTime nowUtc = DateTime.UtcNow;
+            Assert(
+                protectedStore.Save(new[] { CreatePoint(nowUtc.AddSeconds(-3), 10) }),
+                "first history backup fixture save failed");
+            Assert(
+                protectedStore.Save(new[] { CreatePoint(nowUtc.AddSeconds(-2), 20) }),
+                "second history backup fixture save failed");
+            Assert(
+                protectedStore.Save(new[] { CreatePoint(nowUtc.AddSeconds(-1), 30) }),
+                "history save could not rotate an existing backup");
+            string protectedBackupPath = protectedPath + ".bak";
+            string protectedBackupBytes = Convert.ToBase64String(
+                File.ReadAllBytes(protectedBackupPath));
+            File.SetAttributes(
+                protectedPath,
+                File.GetAttributes(protectedPath) | FileAttributes.ReadOnly);
+            try
+            {
+                HistorySaveFailure replacementFailure;
+                Assert(
+                    !protectedStore.Save(
+                        new[] { CreatePoint(nowUtc, 40) },
+                        out replacementFailure),
+                    "read-only primary history was reported as replaced");
+                Assert(
+                    replacementFailure != null &&
+                    replacementFailure.Stage ==
+                        HistorySaveFailureStage.ReplacePrimaryFile,
+                    "read-only history failure reported the wrong stage");
+                Assert(
+                    Convert.ToBase64String(File.ReadAllBytes(protectedBackupPath)) ==
+                        protectedBackupBytes,
+                    "failed history replacement destroyed or changed the existing backup");
+            }
+            finally
+            {
+                File.SetAttributes(
+                    protectedPath,
+                    File.GetAttributes(protectedPath) & ~FileAttributes.ReadOnly);
+            }
         }
 
         private static void TestOversizedHistory(string temporaryRoot)
@@ -381,6 +731,425 @@ namespace TinyHwBar.Tests
             HistoryStore store = new HistoryStore(path);
             Assert(store.Load().Length == 0, "oversized history file was parsed");
             store.Clear();
+        }
+
+        private static void TestHistoryLoadProtection(string temporaryRoot)
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            HistoryPoint[] replacement = new[] { CreatePoint(nowUtc, 77) };
+
+            string missingPath = Path.Combine(temporaryRoot, "history-missing.csv");
+            HistoryStore missingStore = new HistoryStore(missingPath);
+            HistoryLoadResult missing = missingStore.LoadWithStatus();
+            Assert(
+                missing.Status == HistoryLoadStatus.Missing &&
+                !missing.LoadedFromBackup &&
+                missing.BackupStatus == HistoryLoadStatus.Missing &&
+                missing.AllowsAutomaticSave &&
+                !missing.NeedsUserAttention,
+                "missing history did not allow first-run creation");
+            Assert(missingStore.Save(replacement), "missing history could not be created");
+            Assert(
+                new HistoryStore(missingPath).LoadWithStatus().Status ==
+                HistoryLoadStatus.Success,
+                "newly created history did not load successfully");
+
+            string corruptPath = Path.Combine(temporaryRoot, "history-corrupt.csv");
+            const string corruptText = "not-a-history-file\r\n";
+            File.WriteAllText(corruptPath, corruptText, new UTF8Encoding(false));
+            HistoryStore corruptStore = new HistoryStore(corruptPath);
+            HistoryLoadResult corrupt = corruptStore.LoadWithStatus();
+            Assert(
+                corrupt.Status == HistoryLoadStatus.Corrupt &&
+                !corrupt.AllowsAutomaticSave &&
+                corrupt.NeedsUserAttention,
+                "corrupt history was treated as an empty first run");
+            HistorySaveFailure corruptFailure;
+            Assert(
+                !corruptStore.Save(replacement, out corruptFailure) &&
+                corruptFailure != null &&
+                corruptFailure.Stage == HistorySaveFailureStage.ProtectExistingFile,
+                "corrupt history did not block automatic replacement");
+            Assert(
+                File.ReadAllText(corruptPath, Encoding.UTF8) == corruptText,
+                "corrupt history bytes were changed by a blocked save");
+
+            string clearRecoveryPath = Path.Combine(
+                temporaryRoot,
+                "history-clear-recovery.csv");
+            File.WriteAllText(
+                clearRecoveryPath,
+                corruptText,
+                new UTF8Encoding(false));
+            HistoryStore clearRecoveryStore = new HistoryStore(clearRecoveryPath);
+            Assert(
+                clearRecoveryStore.LoadWithStatus().NeedsUserAttention,
+                "clear recovery fixture did not enable load protection");
+            Assert(
+                clearRecoveryStore.Clear(),
+                "a fully deletable history set was not cleared");
+            Assert(
+                !File.Exists(clearRecoveryPath) &&
+                clearRecoveryStore.Save(replacement),
+                "successful history clear did not re-enable persistence");
+
+            string unsupportedPath = Path.Combine(temporaryRoot, "history-future.csv");
+            const string unsupportedText = "TinyHwBarHistory=99\r\n";
+            File.WriteAllText(
+                unsupportedPath,
+                unsupportedText,
+                new UTF8Encoding(false));
+            HistoryStore unsupportedStore = new HistoryStore(unsupportedPath);
+            HistoryLoadResult unsupported = unsupportedStore.LoadWithStatus();
+            Assert(
+                unsupported.Status == HistoryLoadStatus.Unsupported &&
+                !unsupported.AllowsAutomaticSave,
+                "future history schema was accepted for automatic replacement");
+            HistorySaveFailure unsupportedFailure;
+            Assert(
+                !unsupportedStore.Save(replacement, out unsupportedFailure) &&
+                unsupportedFailure.Stage == HistorySaveFailureStage.ProtectExistingFile,
+                "future history schema was not write-protected");
+            Assert(
+                File.ReadAllText(unsupportedPath, Encoding.UTF8) == unsupportedText,
+                "future history schema was changed by a blocked save");
+
+            string ioFailurePath = Path.Combine(temporaryRoot, "history-is-directory");
+            Directory.CreateDirectory(ioFailurePath);
+            HistoryStore ioFailureStore = new HistoryStore(ioFailurePath);
+            HistoryLoadResult ioFailure = ioFailureStore.LoadWithStatus();
+            Assert(
+                ioFailure.Status == HistoryLoadStatus.IoFailure &&
+                !ioFailure.AllowsAutomaticSave,
+                "history I/O failure was treated as missing data");
+            HistorySaveFailure ioSaveFailure;
+            Assert(
+                !ioFailureStore.Save(replacement, out ioSaveFailure) &&
+                ioSaveFailure.Stage == HistorySaveFailureStage.ProtectExistingFile,
+                "history I/O failure did not enable write protection");
+
+            Assert(
+                !ioFailureStore.Clear(),
+                "a directory at the history path was reported as cleared");
+            Assert(
+                Directory.Exists(ioFailurePath),
+                "history clear removed an unexpected directory");
+            HistorySaveFailure ioSaveAfterClearFailure;
+            Assert(
+                !ioFailureStore.Save(replacement, out ioSaveAfterClearFailure) &&
+                ioSaveAfterClearFailure.Stage ==
+                    HistorySaveFailureStage.ProtectExistingFile,
+                "failed history clear disabled load-failure protection");
+
+            string readOnlyPath = Path.Combine(
+                temporaryRoot,
+                "history-read-only.csv");
+            File.WriteAllText(
+                readOnlyPath,
+                corruptText,
+                new UTF8Encoding(false));
+            File.SetAttributes(
+                readOnlyPath,
+                File.GetAttributes(readOnlyPath) | FileAttributes.ReadOnly);
+            try
+            {
+                HistoryStore readOnlyStore = new HistoryStore(readOnlyPath);
+                HistoryLoadResult readOnly = readOnlyStore.LoadWithStatus();
+                Assert(
+                    readOnly.Status == HistoryLoadStatus.Corrupt &&
+                    !readOnly.AllowsAutomaticSave,
+                    "read-only corrupt history was not protected");
+                Assert(
+                    !readOnlyStore.Clear(),
+                    "an undeletable history file was reported as cleared");
+                Assert(
+                    File.Exists(readOnlyPath),
+                    "failed history clear removed the protected source file");
+                HistorySaveFailure readOnlySaveFailure;
+                Assert(
+                    !readOnlyStore.Save(replacement, out readOnlySaveFailure) &&
+                    readOnlySaveFailure.Stage ==
+                        HistorySaveFailureStage.ProtectExistingFile,
+                    "failed read-only clear disabled load-failure protection");
+            }
+            finally
+            {
+                if (File.Exists(readOnlyPath))
+                {
+                    File.SetAttributes(readOnlyPath, FileAttributes.Normal);
+                }
+            }
+
+            string partialClearPath = Path.Combine(
+                temporaryRoot,
+                "history-partial-clear.csv");
+            HistoryStore partialClearStore = new HistoryStore(partialClearPath);
+            Assert(
+                partialClearStore.Save(
+                    new[] { CreatePoint(DateTime.UtcNow.AddSeconds(-2), 41) }),
+                "partial-clear primary fixture save failed");
+            Assert(
+                partialClearStore.Save(
+                    new[] { CreatePoint(DateTime.UtcNow.AddSeconds(-1), 42) }),
+                "partial-clear backup fixture save failed");
+            HistoryLoadResult partialClearLoad = partialClearStore.LoadWithStatus();
+            Assert(
+                partialClearLoad.Status == HistoryLoadStatus.Success &&
+                partialClearLoad.AllowsAutomaticSave,
+                "partial-clear fixture did not start in a writable state");
+            string partialClearBackupPath = partialClearPath + ".bak";
+            string partialClearBackupBytes = Convert.ToBase64String(
+                File.ReadAllBytes(partialClearBackupPath));
+            File.SetAttributes(
+                partialClearBackupPath,
+                File.GetAttributes(partialClearBackupPath) | FileAttributes.ReadOnly);
+            try
+            {
+                Assert(
+                    !partialClearStore.Clear(),
+                    "partial history deletion was reported as a complete clear");
+                Assert(
+                    !File.Exists(partialClearPath) &&
+                    File.Exists(partialClearBackupPath),
+                    "partial-clear fixture did not isolate the backup deletion failure");
+                HistorySaveFailure partialClearFailure;
+                Assert(
+                    !partialClearStore.Save(
+                        new[] { CreatePoint(DateTime.UtcNow, 43) },
+                        out partialClearFailure) &&
+                    partialClearFailure.Stage ==
+                        HistorySaveFailureStage.ProtectExistingFile,
+                    "partial clear allowed persistence to recreate deleted history");
+                Assert(
+                    !File.Exists(partialClearPath) &&
+                    Convert.ToBase64String(
+                        File.ReadAllBytes(partialClearBackupPath)) ==
+                        partialClearBackupBytes,
+                    "save after a partial clear changed the remaining history state");
+            }
+            finally
+            {
+                if (File.Exists(partialClearBackupPath))
+                {
+                    File.SetAttributes(
+                        partialClearBackupPath,
+                        FileAttributes.Normal);
+                }
+            }
+        }
+
+        private static void TestHistoryBackupRecovery(string temporaryRoot)
+        {
+            string path = Path.Combine(temporaryRoot, "history-backup.csv");
+            DateTime nowUtc = DateTime.UtcNow;
+            HistoryPoint[] first = new[] { CreatePoint(nowUtc.AddSeconds(-2), 11) };
+            HistoryPoint[] second = new[] { CreatePoint(nowUtc.AddSeconds(-1), 22) };
+            HistoryStore store = new HistoryStore(path);
+            Assert(store.Save(first), "initial history save failed");
+            Assert(store.Save(second), "history replacement failed");
+            Assert(File.Exists(path + ".bak"), "normal replacement did not retain a backup");
+
+            const string corruptPrimary = "broken-primary\r\n";
+            File.WriteAllText(path, corruptPrimary, new UTF8Encoding(false));
+            HistoryStore recoveringStore = new HistoryStore(path);
+            HistoryLoadResult recovered = recoveringStore.LoadWithStatus();
+            Assert(
+                recovered.Status == HistoryLoadStatus.Corrupt &&
+                recovered.LoadedFromBackup &&
+                recovered.BackupStatus == HistoryLoadStatus.Success,
+                "valid history backup was not recovered into memory");
+            Assert(
+                recovered.Points.Length == 1 &&
+                recovered.Points[0].CpuPercent == 11,
+                "recovered history did not use the previous valid generation");
+            Assert(
+                !recovered.AllowsAutomaticSave,
+                "backup recovery unexpectedly allowed overwriting the corrupt primary");
+
+            HistorySaveFailure failure;
+            Assert(
+                !recoveringStore.Save(second, out failure) &&
+                failure.Stage == HistorySaveFailureStage.ProtectExistingFile,
+                "backup recovery did not preserve the damaged primary for inspection");
+            Assert(
+                File.ReadAllText(path, Encoding.UTF8) == corruptPrimary,
+                "backup recovery silently replaced the damaged primary");
+
+            string backupOnlyPath = Path.Combine(
+                temporaryRoot,
+                "history-backup-only.csv");
+            HistoryStore backupOnlyFixtureStore = new HistoryStore(backupOnlyPath);
+            Assert(
+                backupOnlyFixtureStore.Save(first),
+                "backup-only primary fixture save failed");
+            Assert(
+                backupOnlyFixtureStore.Save(second),
+                "backup-only backup fixture save failed");
+            string backupOnlyBackupPath = backupOnlyPath + ".bak";
+            string backupOnlyBytes = Convert.ToBase64String(
+                File.ReadAllBytes(backupOnlyBackupPath));
+            File.Delete(backupOnlyPath);
+
+            HistoryStore backupOnlyStore = new HistoryStore(backupOnlyPath);
+            HistoryLoadResult backupOnly = backupOnlyStore.LoadWithStatus();
+            Assert(
+                backupOnly.Status == HistoryLoadStatus.Missing &&
+                backupOnly.LoadedFromBackup &&
+                backupOnly.BackupStatus == HistoryLoadStatus.Success &&
+                !backupOnly.AllowsAutomaticSave &&
+                backupOnly.NeedsUserAttention,
+                "backup-only history did not retain write protection");
+            Assert(
+                backupOnly.Points.Length == 1 &&
+                backupOnly.Points[0].CpuPercent == 11,
+                "backup-only history did not recover the previous generation");
+
+            HistorySaveFailure backupOnlyFailure;
+            Assert(
+                !backupOnlyStore.Save(second, out backupOnlyFailure) &&
+                backupOnlyFailure != null &&
+                backupOnlyFailure.Stage ==
+                    HistorySaveFailureStage.ProtectExistingFile,
+                "backup-only recovery allowed automatic primary recreation");
+            Assert(
+                !File.Exists(backupOnlyPath),
+                "backup-only recovery recreated the missing primary");
+            Assert(
+                Convert.ToBase64String(
+                    File.ReadAllBytes(backupOnlyBackupPath)) ==
+                    backupOnlyBytes,
+                "backup-only recovery changed the backup bytes");
+        }
+
+        private static void TestHistoryProtectionWarningGate()
+        {
+            HistorySaveFailure protectedLoadFailure = new HistorySaveFailure(
+                HistorySaveFailureStage.ProtectExistingFile,
+                "ProtectedLoadState",
+                null);
+            HistorySaveFailure writeFailure = new HistorySaveFailure(
+                HistorySaveFailureStage.WriteTemporaryFile,
+                "IOException",
+                null);
+
+            Assert(
+                !MonitorForm.ShouldWarnForHistorySaveFailure(null),
+                "a missing history failure requested a warning");
+            Assert(
+                !MonitorForm.ShouldWarnForHistorySaveFailure(
+                    protectedLoadFailure),
+                "the load-protection state consumed the normal save-warning gate");
+            Assert(
+                MonitorForm.ShouldWarnForHistorySaveFailure(writeFailure),
+                "a real history write failure no longer requests a warning");
+
+            HistoryPersistenceWarningGate gate =
+                new HistoryPersistenceWarningGate();
+            int staleGeneration = gate.CaptureGeneration();
+            Assert(
+                gate.TrySchedule(staleGeneration),
+                "the initial history save warning was not scheduled");
+
+            gate.Reset();
+            int currentGeneration = gate.CaptureGeneration();
+            Assert(
+                currentGeneration != staleGeneration,
+                "history warning reset did not advance the generation");
+            Assert(
+                !gate.TryShow(staleGeneration),
+                "a pre-clear history failure showed after a successful clear");
+            Assert(
+                !gate.TrySchedule(staleGeneration),
+                "a pre-clear history failure reclaimed the warning gate");
+            Assert(
+                gate.TrySchedule(currentGeneration) &&
+                gate.TryShow(currentGeneration),
+                "a stale warning suppressed a later real save failure");
+        }
+
+        private static void TestHistorySnapshotTimestamp()
+        {
+            DateTime sampledAtUtc = new DateTime(
+                2026,
+                7,
+                17,
+                2,
+                3,
+                4,
+                DateTimeKind.Utc);
+            HardwareSnapshot snapshot = new HardwareSnapshot
+            {
+                SampledAtUtc = sampledAtUtc,
+                CpuPercent = 10,
+                MemoryPercent = 20
+            };
+            HistoryPoint point = HistoryPoint.FromSnapshot(snapshot);
+            Assert(
+                point.TimestampUtc == sampledAtUtc,
+                "history timestamp drifted from the completed hardware sample");
+        }
+
+        private static void TestHistoryChartTimeline()
+        {
+            DateTime startUtc = new DateTime(
+                2026,
+                7,
+                17,
+                1,
+                0,
+                0,
+                DateTimeKind.Utc);
+            RectangleF bounds = new RectangleF(10.0f, 0.0f, 100.0f, 50.0f);
+            Assert(
+                Math.Abs(HistoryChartControl.MapTimestampToX(
+                    startUtc,
+                    startUtc,
+                    startUtc.AddSeconds(100),
+                    bounds) - 10.0f) < 0.01f,
+                "history start time did not map to the left edge");
+            Assert(
+                Math.Abs(HistoryChartControl.MapTimestampToX(
+                    startUtc.AddSeconds(25),
+                    startUtc,
+                    startUtc.AddSeconds(100),
+                    bounds) - 35.0f) < 0.01f,
+                "history timestamp was not mapped proportionally");
+            Assert(
+                Math.Abs(HistoryChartControl.MapTimestampToX(
+                    startUtc,
+                    startUtc,
+                    startUtc,
+                    bounds) - 60.0f) < 0.01f,
+                "single history point was not centered");
+
+            HistoryPoint first = CreatePoint(startUtc, 10);
+            HistoryPoint second = CreatePoint(startUtc.AddSeconds(2), 20);
+            HistoryPoint third = CreatePoint(startUtc.AddSeconds(4), 30);
+            HistoryPoint afterGap = CreatePoint(startUtc.AddMinutes(5), 40);
+            HistoryPoint[] timeline = new[] { first, second, third, afterGap };
+            TimeSpan threshold = HistoryChartControl.CalculateConnectionGapThreshold(timeline);
+            Assert(
+                HistoryChartControl.ArePointsConnected(first, second, threshold),
+                "normal history samples were split into separate segments");
+            Assert(
+                !HistoryChartControl.ArePointsConnected(third, afterGap, threshold),
+                "long history gap was drawn as continuous data");
+
+            using (HistoryChartControl chart = new HistoryChartControl())
+            {
+                chart.SetPoints(new[] { afterGap, second, first, third });
+                FieldInfo pointsField = typeof(HistoryChartControl).GetField(
+                    "points",
+                    BindingFlags.Instance | BindingFlags.NonPublic);
+                HistoryPoint[] sorted = pointsField == null
+                    ? null
+                    : pointsField.GetValue(chart) as HistoryPoint[];
+                Assert(sorted != null && sorted.Length == 4, "chart point snapshot is missing");
+                Assert(
+                    sorted[0].TimestampUtc == first.TimestampUtc &&
+                    sorted[3].TimestampUtc == afterGap.TimestampUtc,
+                    "chart did not normalize clock rollback or out-of-order points");
+            }
         }
 
         private static void TestGatewayDisabledBoundary()
@@ -415,6 +1184,69 @@ namespace TinyHwBar.Tests
                     unavailable.Status == GatewayLatencyStatus.NetworkUnavailable,
                     "unavailable network was not reported");
                 Assert(sendCount == 0, "unavailable network invoked the sender");
+            }
+        }
+
+        private static void TestGatewayGlobalProbeInterval()
+        {
+            int sendCount = 0;
+            GatewayEchoSender sender = delegate(IPAddress target, int timeout)
+            {
+                sendCount++;
+                return Task.FromResult(GatewayEchoResult.CreateAvailable(1));
+            };
+            GatewayTargetValidator validator = delegate(
+                NetworkMetrics metrics,
+                out IPAddress target)
+            {
+                target = metrics == null
+                    ? null
+                    : IPAddress.Parse(metrics.DefaultGatewayAddress);
+                return target == null
+                    ? GatewayLatencyStatus.GatewayMissing
+                    : GatewayLatencyStatus.Available;
+            };
+
+            using (GatewayLatencySampler sampler = new GatewayLatencySampler(
+                sender,
+                TimeSpan.FromSeconds(10),
+                750,
+                validator))
+            {
+                sampler.SetEnabled(true);
+                sampler.Sample(NetworkMetrics.CreateAvailable(
+                    "test-interface",
+                    "test",
+                    "192.168.1.1",
+                    null,
+                    null,
+                    null));
+                Assert(sendCount == 1, "initial gateway probe was not sent");
+
+                GatewayLatencyMetrics changedTarget = sampler.Sample(
+                    NetworkMetrics.CreateAvailable(
+                        "test-interface",
+                        "test",
+                        "192.168.1.2",
+                        null,
+                        null,
+                        null));
+                Assert(sendCount == 1, "target change bypassed the global probe interval");
+                Assert(
+                    changedTarget.GatewayAddress == "192.168.1.2" &&
+                    changedTarget.Status == GatewayLatencyStatus.Waiting,
+                    "target change did not retain the pending target state");
+
+                sampler.SetEnabled(false);
+                sampler.SetEnabled(true);
+                sampler.Sample(NetworkMetrics.CreateAvailable(
+                    "test-interface",
+                    "test",
+                    "192.168.1.2",
+                    null,
+                    null,
+                    null));
+                Assert(sendCount == 1, "enable toggle bypassed the global probe interval");
             }
         }
 
@@ -509,6 +1341,516 @@ namespace TinyHwBar.Tests
             Assert(
                 nextLocation == new Point(310, 315),
                 "rebased cross-display drag anchor caused a location jump");
+        }
+
+        private static void TestSingletonMutexName()
+        {
+            Assert(
+                Program.BuildSingletonMutexName("S-1-5-21-100-200-300-1001") ==
+                @"Global\TinyHwBar.Singleton.S-1-5-21-100-200-300-1001",
+                "singleton mutex is not shared across sessions for the same user");
+            Assert(
+                Program.BuildSingletonMutexName(string.Empty) ==
+                @"Local\TinyHwBar.Singleton",
+                "empty SID did not use the compatibility fallback");
+            Assert(
+                Program.BuildSingletonMutexName(@"Global\Injected") ==
+                @"Local\TinyHwBar.Singleton",
+                "mutex namespace injection was accepted");
+        }
+
+        private static void TestSingletonMutexSecurity()
+        {
+            const string validSidText = "S-1-5-21-100-200-300-1001";
+            Assert(
+                Program.BuildRequiredSingletonMutexName(validSidText) ==
+                    @"Global\TinyHwBar.Singleton." + validSidText,
+                "the required singleton name did not use a canonical SID");
+            AssertRequiredSingletonNameRejected(string.Empty);
+            AssertRequiredSingletonNameRejected("not-a-sid");
+            AssertRequiredSingletonNameRejected(@"Global\Injected");
+
+            SecurityIdentifier currentUserSid;
+            string currentMutexName = Program.GetSingletonMutexName(
+                out currentUserSid);
+            Assert(
+                currentUserSid != null &&
+                currentMutexName == Program.BuildRequiredSingletonMutexName(
+                    currentUserSid.Value) &&
+                currentMutexName.StartsWith(
+                    @"Global\TinyHwBar.Singleton.",
+                    StringComparison.Ordinal),
+                "the production singleton path did not require the current user SID");
+
+            MutexSecurity trustedSecurity =
+                Program.CreateTrustedGlobalMutexSecurity(currentUserSid);
+            Assert(
+                Program.IsTrustedGlobalMutexSecurity(
+                    trustedSecurity,
+                    currentUserSid),
+                "the intended Global mutex ACL did not pass validation");
+
+            SecurityIdentifier worldSid = new SecurityIdentifier(
+                WellKnownSidType.WorldSid,
+                null);
+            MutexSecurity broadSecurity =
+                Program.CreateTrustedGlobalMutexSecurity(currentUserSid);
+            broadSecurity.AddAccessRule(new MutexAccessRule(
+                worldSid,
+                MutexRights.Synchronize,
+                AccessControlType.Allow));
+            Assert(
+                !Program.IsTrustedGlobalMutexSecurity(
+                    broadSecurity,
+                    currentUserSid),
+                "an extra World ACE was accepted for the Global mutex");
+
+            SecurityIdentifier localSystemSid = new SecurityIdentifier(
+                WellKnownSidType.LocalSystemSid,
+                null);
+            SecurityIdentifier wrongOwner = string.Equals(
+                currentUserSid.Value,
+                localSystemSid.Value,
+                StringComparison.OrdinalIgnoreCase)
+                ? new SecurityIdentifier(
+                    WellKnownSidType.BuiltinAdministratorsSid,
+                    null)
+                : localSystemSid;
+            MutexSecurity wrongOwnerSecurity =
+                Program.CreateTrustedGlobalMutexSecurity(currentUserSid);
+            wrongOwnerSecurity.SetOwner(wrongOwner);
+            Assert(
+                !Program.IsTrustedGlobalMutexSecurity(
+                    wrongOwnerSecurity,
+                    currentUserSid),
+                "a Global mutex owned by another SID was accepted");
+
+            string suffix = Guid.NewGuid().ToString("N");
+            string globalName =
+                @"Global\TinyHwBar.Tests.Singleton.Security." + suffix;
+            string legacyName =
+                @"Local\TinyHwBar.Tests.Singleton.Security.Legacy." + suffix;
+            bool missingSidRejected = false;
+            try
+            {
+                Program.TryAcquireSingletonMutexes(
+                    globalName,
+                    legacyName,
+                    null);
+            }
+            catch (SingletonMutexSecurityException)
+            {
+                missingSidRejected = true;
+            }
+
+            Assert(
+                missingSidRejected,
+                "a Global singleton mutex was created without an owner SID");
+
+            IDisposable lease = Program.TryAcquireSingletonMutexes(
+                globalName,
+                legacyName,
+                currentUserSid);
+            Assert(lease != null, "the secured Global singleton mutex was not created");
+            try
+            {
+                using (Mutex inspectionHandle = Mutex.OpenExisting(
+                    globalName,
+                    MutexRights.ReadPermissions))
+                {
+                    Assert(
+                        Program.IsTrustedGlobalMutexSecurity(
+                            inspectionHandle.GetAccessControl(),
+                            currentUserSid),
+                        "the live Global mutex owner or ACL changed after creation");
+                }
+
+                Assert(
+                    !CanAcquireSingletonMutexesOnWorker(
+                        globalName,
+                        legacyName,
+                        currentUserSid),
+                    "a pre-existing trusted Global mutex was reacquired");
+            }
+            finally
+            {
+                lease.Dispose();
+            }
+
+            string preExistingGlobalName =
+                @"Global\TinyHwBar.Tests.Singleton.PreExisting." + suffix;
+            bool preExistingCreatedNew;
+            using (Mutex preExistingMutex = new Mutex(
+                false,
+                preExistingGlobalName,
+                out preExistingCreatedNew,
+                trustedSecurity))
+            {
+                Assert(
+                    preExistingCreatedNew,
+                    "the trusted pre-existing Global mutex fixture already existed");
+                IDisposable preExistingLease = Program.TryAcquireSingletonMutexes(
+                    preExistingGlobalName,
+                    legacyName,
+                    currentUserSid);
+                try
+                {
+                    Assert(
+                        preExistingLease == null,
+                        "an unowned pre-existing Global mutex was reacquired");
+                }
+                finally
+                {
+                    if (preExistingLease != null)
+                    {
+                        preExistingLease.Dispose();
+                    }
+                }
+            }
+
+            string untrustedGlobalName =
+                @"Global\TinyHwBar.Tests.Singleton.Untrusted." + suffix;
+            bool untrustedCreatedNew;
+            using (Mutex untrustedMutex = new Mutex(
+                false,
+                untrustedGlobalName,
+                out untrustedCreatedNew,
+                broadSecurity))
+            {
+                Assert(
+                    untrustedCreatedNew,
+                    "the untrusted Global mutex fixture already existed");
+                bool untrustedRejected = false;
+                IDisposable unexpectedLease = null;
+                try
+                {
+                    unexpectedLease = Program.TryAcquireSingletonMutexes(
+                        untrustedGlobalName,
+                        legacyName,
+                        currentUserSid);
+                }
+                catch (SingletonMutexSecurityException)
+                {
+                    untrustedRejected = true;
+                }
+                finally
+                {
+                    if (unexpectedLease != null)
+                    {
+                        unexpectedLease.Dispose();
+                    }
+                }
+
+                Assert(
+                    untrustedRejected,
+                    "a pre-created Global mutex with an extra ACE was trusted");
+            }
+        }
+
+        private static void AssertRequiredSingletonNameRejected(string userSid)
+        {
+            bool rejected = false;
+            try
+            {
+                Program.BuildRequiredSingletonMutexName(userSid);
+            }
+            catch (SingletonIdentityUnavailableException)
+            {
+                rejected = true;
+            }
+
+            Assert(rejected, "an invalid SID reached the production mutex path");
+        }
+
+        private static void TestSingletonMutexCompatibility()
+        {
+            string suffix = Guid.NewGuid().ToString("N");
+            string primaryName =
+                @"Local\TinyHwBar.Tests.Singleton.Primary." + suffix;
+            string legacyName =
+                @"Local\TinyHwBar.Tests.Singleton.Legacy." + suffix;
+
+            IDisposable lease = Program.TryAcquireSingletonMutexes(
+                primaryName,
+                legacyName);
+            Assert(lease != null, "the singleton mutex pair could not be acquired");
+            try
+            {
+                Assert(
+                    !CanAcquireSingletonMutexesOnWorker(
+                        primaryName,
+                        legacyName),
+                    "a second current instance acquired the singleton mutex pair");
+                Assert(
+                    !CanStartLegacyInstanceOnWorker(legacyName),
+                    "a legacy instance ignored the current instance compatibility mutex");
+            }
+            finally
+            {
+                lease.Dispose();
+            }
+
+            Assert(
+                CanAcquireSingletonMutexesOnWorker(primaryName, legacyName),
+                "disposing the singleton lease did not release both mutexes");
+
+            using (Mutex legacyOwner = new Mutex(false, legacyName))
+            {
+                bool legacyOwned = TryOwnMutex(legacyOwner);
+                try
+                {
+                    Assert(legacyOwned, "the legacy test mutex could not be acquired");
+                    Assert(
+                        !CanAcquireSingletonMutexesOnWorker(
+                            primaryName,
+                            legacyName),
+                        "a current instance ignored a running legacy instance");
+
+                    using (Mutex primaryProbe = new Mutex(false, primaryName))
+                    {
+                        bool primaryOwned = TryOwnMutex(primaryProbe);
+                        try
+                        {
+                            Assert(
+                                primaryOwned,
+                                "a rejected legacy-instance launch leaked the primary mutex");
+                        }
+                        finally
+                        {
+                            if (primaryOwned)
+                            {
+                                primaryProbe.ReleaseMutex();
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    if (legacyOwned)
+                    {
+                        legacyOwner.ReleaseMutex();
+                    }
+                }
+            }
+
+            using (Mutex primaryOwner = new Mutex(false, primaryName))
+            {
+                bool primaryOwned = TryOwnMutex(primaryOwner);
+                try
+                {
+                    Assert(primaryOwned, "the primary test mutex could not be acquired");
+                    Assert(
+                        !CanAcquireSingletonMutexesOnWorker(
+                            primaryName,
+                            legacyName),
+                        "a current instance ignored the primary singleton mutex");
+
+                    using (Mutex legacyProbe = new Mutex(false, legacyName))
+                    {
+                        bool legacyOwned = TryOwnMutex(legacyProbe);
+                        try
+                        {
+                            Assert(
+                                legacyOwned,
+                                "a rejected current-instance launch leaked the legacy mutex");
+                        }
+                        finally
+                        {
+                            if (legacyOwned)
+                            {
+                                legacyProbe.ReleaseMutex();
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    if (primaryOwned)
+                    {
+                        primaryOwner.ReleaseMutex();
+                    }
+                }
+            }
+
+            string collisionPrimaryName =
+                @"Local\TinyHwBar.Tests.Singleton.Collision.Primary." + suffix;
+            string collisionLegacyName =
+                @"Local\TinyHwBar.Tests.Singleton.Collision.Legacy." + suffix;
+            bool eventCreatedNew;
+            using (EventWaitHandle collision = new EventWaitHandle(
+                false,
+                EventResetMode.ManualReset,
+                collisionLegacyName,
+                out eventCreatedNew))
+            {
+                Assert(
+                    eventCreatedNew,
+                    "the legacy mutex type-collision fixture already existed");
+                bool collisionRejected = false;
+                IDisposable unexpectedLease = null;
+                try
+                {
+                    unexpectedLease = Program.TryAcquireSingletonMutexes(
+                        collisionPrimaryName,
+                        collisionLegacyName);
+                }
+                catch (WaitHandleCannotBeOpenedException)
+                {
+                    collisionRejected = true;
+                }
+                finally
+                {
+                    if (unexpectedLease != null)
+                    {
+                        unexpectedLease.Dispose();
+                    }
+                }
+
+                Assert(
+                    collisionRejected,
+                    "a non-mutex legacy named object was not rejected fail-closed");
+                using (Mutex primaryProbe = new Mutex(
+                    false,
+                    collisionPrimaryName))
+                {
+                    bool primaryOwned = TryOwnMutex(primaryProbe);
+                    try
+                    {
+                        Assert(
+                            primaryOwned,
+                            "a legacy mutex type collision leaked the primary mutex");
+                    }
+                    finally
+                    {
+                        if (primaryOwned)
+                        {
+                            primaryProbe.ReleaseMutex();
+                        }
+                    }
+                }
+            }
+
+            string fallbackName =
+                @"Local\TinyHwBar.Tests.Singleton.Fallback." + suffix;
+            IDisposable fallbackLease = Program.TryAcquireSingletonMutexes(
+                fallbackName,
+                fallbackName);
+            Assert(
+                fallbackLease != null,
+                "the duplicate-name Local fallback could not be acquired");
+            try
+            {
+                Assert(
+                    !CanAcquireSingletonMutexesOnWorker(
+                        fallbackName,
+                        fallbackName),
+                    "the Local fallback did not enforce a singleton");
+            }
+            finally
+            {
+                fallbackLease.Dispose();
+            }
+        }
+
+        private static bool CanAcquireSingletonMutexesOnWorker(
+            string primaryName,
+            string legacyName)
+        {
+            return RunOnDedicatedWorker(
+                delegate
+                {
+                    using (IDisposable lease = Program.TryAcquireSingletonMutexes(
+                        primaryName,
+                        legacyName))
+                    {
+                        return lease != null;
+                    }
+                });
+        }
+
+        private static bool CanAcquireSingletonMutexesOnWorker(
+            string primaryName,
+            string legacyName,
+            SecurityIdentifier currentUserSid)
+        {
+            return RunOnDedicatedWorker(
+                delegate
+                {
+                    using (IDisposable lease = Program.TryAcquireSingletonMutexes(
+                        primaryName,
+                        legacyName,
+                        currentUserSid))
+                    {
+                        return lease != null;
+                    }
+                });
+        }
+
+        private static bool CanStartLegacyInstanceOnWorker(string legacyName)
+        {
+            return RunOnDedicatedWorker(
+                delegate
+                {
+                    bool createdNew;
+                    using (Mutex mutex = new Mutex(
+                        true,
+                        legacyName,
+                        out createdNew))
+                    {
+                        if (createdNew)
+                        {
+                            mutex.ReleaseMutex();
+                        }
+
+                        return createdNew;
+                    }
+                });
+        }
+
+        private static bool RunOnDedicatedWorker(Func<bool> action)
+        {
+            bool result = false;
+            Exception workerFailure = null;
+            Thread worker = new Thread(
+                new ThreadStart(delegate
+                {
+                    try
+                    {
+                        result = action();
+                    }
+                    catch (Exception exception)
+                    {
+                        workerFailure = exception;
+                    }
+                }));
+            worker.IsBackground = true;
+            worker.Start();
+            if (!worker.Join(5000))
+            {
+                throw new InvalidOperationException(
+                    "The dedicated singleton mutex test worker did not finish.");
+            }
+
+            if (workerFailure != null)
+            {
+                throw new InvalidOperationException(
+                    "The dedicated singleton mutex test worker failed.",
+                    workerFailure);
+            }
+
+            return result;
+        }
+
+        private static bool TryOwnMutex(Mutex mutex)
+        {
+            try
+            {
+                return mutex.WaitOne(0, false);
+            }
+            catch (AbandonedMutexException)
+            {
+                return true;
+            }
         }
 
         private static void TestNetworkRouteSelection()
@@ -734,6 +2076,36 @@ namespace TinyHwBar.Tests
                     IntelAdapterIntegrationKind.Unknown
                 }) == IntelGpuDataStatus.AmbiguousAdapter,
                 "multiple unknown adapters were not reported as ambiguous");
+            Assert(
+                GpuRoleSampler.ResolveAutomaticSelectionStatus(
+                    GpuAdapterRole.Discrete,
+                    new[]
+                    {
+                        IntelAdapterIntegrationKind.Discrete,
+                        IntelAdapterIntegrationKind.Discrete
+                    },
+                    2) == IntelGpuDataStatus.AmbiguousAdapter,
+                "automatic selection guessed between multiple discrete adapters");
+            Assert(
+                GpuRoleSampler.ResolveAutomaticSelectionStatus(
+                    GpuAdapterRole.Discrete,
+                    new[]
+                    {
+                        IntelAdapterIntegrationKind.Discrete,
+                        IntelAdapterIntegrationKind.Unknown
+                    },
+                    1) == IntelGpuDataStatus.AmbiguousAdapter,
+                "automatic selection ignored an unknown adapter beside a known role");
+            Assert(
+                GpuRoleSampler.ResolveAutomaticSelectionStatus(
+                    GpuAdapterRole.Integrated,
+                    new[]
+                    {
+                        IntelAdapterIntegrationKind.Integrated,
+                        IntelAdapterIntegrationKind.Discrete
+                    },
+                    1) == IntelGpuDataStatus.Available,
+                "automatic selection rejected a unique classified integrated adapter");
 
             Assert(GpuRoleSampler.IsSupportedVendor(GpuRoleSampler.NvidiaVendorId), "NVIDIA vendor was rejected");
             Assert(GpuRoleSampler.IsSupportedVendor(GpuRoleSampler.AmdVendorId), "AMD vendor was rejected");
@@ -762,49 +2134,26 @@ namespace TinyHwBar.Tests
             Assert(GpuRoleSampler.TryRegisterAdapterLuid(seenLuids, 2, 2), "different low LUID was removed");
             Assert(GpuRoleSampler.TryRegisterAdapterLuid(seenLuids, 1, 3), "different high LUID was removed");
             Assert(
-                GpuRoleSampler.IsSameReportedAdapterIdentity(
-                    " Intel(R) Graphics ",
-                    GpuRoleSampler.IntelVendorId,
-                    1,
-                    2,
-                    "intel(r) graphics",
-                    GpuRoleSampler.IntelVendorId,
-                    1,
-                    2),
-                "unclassified mirrored adapter identity was not recognized");
+                GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(
+                    @"\\?\ROOT#DISPLAY#0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}"),
+                "root-enumerated display adapter was not recognized");
             Assert(
-                !GpuRoleSampler.IsSameReportedAdapterIdentity(
-                    "Intel(R) Graphics",
-                    GpuRoleSampler.IntelVendorId,
-                    1,
-                    2,
-                    "Intel(R) Graphics",
-                    GpuRoleSampler.NvidiaVendorId,
-                    1,
-                    2),
-                "different vendors were treated as the same adapter identity");
+                GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(
+                    @"\\?\root#display#0000#{5b45201d-f2f2-4f3b-85bb-30ff1f953599}"),
+                "root-enumerated display path matching became case-sensitive");
             Assert(
-                !GpuRoleSampler.IsSameReportedAdapterIdentity(
-                    string.Empty,
-                    GpuRoleSampler.IntelVendorId,
-                    1,
-                    2,
-                    string.Empty,
-                    GpuRoleSampler.IntelVendorId,
-                    1,
-                    2),
-                "empty adapter descriptions were collapsed");
+                !GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(
+                    @"\\?\PCI#VEN_8086&DEV_7D67#TEST"),
+                "physical PCI adapter was treated as a root display adapter");
             Assert(
-                !GpuRoleSampler.IsSameReportedAdapterIdentity(
-                    "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
-                    GpuRoleSampler.NvidiaVendorId,
-                    1,
-                    2,
-                    "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
-                    GpuRoleSampler.NvidiaVendorId,
-                    3,
-                    4),
-                "same-vendor same-model adapters with distinct LUIDs were collapsed");
+                !GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(
+                    @"\\?\ROOT#SYSTEM#0000#{TEST}"),
+                "unrelated root device was treated as a display adapter");
+            Assert(
+                !GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(null) &&
+                !GpuRoleSampler.IsRootEnumeratedDisplayDevicePath(string.Empty) &&
+                !GpuRoleSampler.IsRootEnumeratedDisplayDevicePath("   "),
+                "missing device paths were treated as root display adapters");
         }
 
         private static void TestGpuRoleSnapshotMapping()
@@ -862,6 +2211,127 @@ namespace TinyHwBar.Tests
             Assert(
                 snapshot.IntegratedGpuDetected && snapshot.IntegratedGpuPercent == 17,
                 "discrete failure cleared integrated GPU data");
+        }
+
+        private static void TestGpuSelectionDecisions()
+        {
+            HardwareSnapshot snapshot = new HardwareSnapshot
+            {
+                GpuMode = GpuDisplayMode.Available,
+                DiscreteGpuDetected = true,
+                DiscreteGpuId = "00000001:00000002",
+                DiscreteGpuName = "Discrete GPU",
+                GpuPercent = 72,
+                IntegratedGpuDetected = true,
+                IntegratedGpuId = "00000003:00000004",
+                IntegratedGpuName = "Integrated GPU",
+                IntegratedGpuPercent = 18
+            };
+
+            HardwareSampler.ResolveGpuSelection(
+                snapshot,
+                GpuSelectionMode.Automatic,
+                string.Empty,
+                string.Empty);
+            Assert(
+                snapshot.GpuSelectionStatus == GpuSelectionStatus.Automatic,
+                "automatic GPU selection status changed");
+            Assert(!snapshot.BarUsesIntegratedGpu, "automatic selection did not prefer an available dGPU");
+            Assert(
+                snapshot.EffectiveGpuAdapterId == snapshot.DiscreteGpuId,
+                "automatic dGPU identity was not exposed");
+
+            snapshot.GpuMode = GpuDisplayMode.Eco;
+            snapshot.GpuPercent = null;
+            HardwareSampler.ResolveGpuSelection(
+                snapshot,
+                GpuSelectionMode.Automatic,
+                string.Empty,
+                string.Empty);
+            Assert(snapshot.BarUsesIntegratedGpu, "automatic selection did not fall back to the active iGPU");
+            Assert(
+                snapshot.EffectiveGpuAdapterId == snapshot.IntegratedGpuId,
+                "automatic iGPU fallback identity was not exposed");
+            Assert(
+                snapshot.ToDisplayText().IndexOf("iGPU 18%", StringComparison.Ordinal) >= 0,
+                "main bar text did not identify the automatic iGPU fallback");
+
+            HardwareSnapshot integratedFirstSample = new HardwareSnapshot
+            {
+                GpuMode = GpuDisplayMode.Unavailable,
+                DiscreteGpuDetected = false,
+                IntegratedGpuDetected = true,
+                IntegratedGpuId = "00000005:00000006",
+                IntegratedGpuName = "Integrated First Sample GPU",
+                IntegratedGpuPercent = null,
+                IntegratedSharedMemoryBytes = 2L * 1024L * 1024L * 1024L,
+                IntegratedSharedMemoryLimitBytes = 8L * 1024L * 1024L * 1024L,
+                IntegratedUtilizationStatus = IntelGpuDataStatus.FirstSamplePending,
+                IntegratedMemoryStatus = IntelGpuDataStatus.Available
+            };
+            HardwareSampler.ResolveGpuSelection(
+                integratedFirstSample,
+                GpuSelectionMode.Automatic,
+                string.Empty,
+                string.Empty);
+            Assert(
+                integratedFirstSample.BarUsesIntegratedGpu &&
+                integratedFirstSample.EffectiveGpuAdapterId ==
+                    integratedFirstSample.IntegratedGpuId,
+                "iGPU-only first sample was not selected without utilization data");
+            string integratedFirstSampleText = integratedFirstSample.ToDisplayText();
+            Assert(
+                integratedFirstSampleText.IndexOf(
+                    "iGPU --",
+                    StringComparison.Ordinal) >= 0 &&
+                integratedFirstSampleText.IndexOf(
+                    "VR 25%",
+                    StringComparison.Ordinal) >= 0,
+                "iGPU-only first sample did not retain its displayable memory data");
+
+            snapshot.GpuMode = GpuDisplayMode.Available;
+            snapshot.GpuPercent = 72;
+            snapshot.DiscreteGpuSelectionMatched = false;
+            snapshot.IntegratedGpuSelectionMatched = true;
+            HardwareSampler.ResolveGpuSelection(
+                snapshot,
+                GpuSelectionMode.Manual,
+                snapshot.IntegratedGpuId,
+                snapshot.IntegratedGpuName);
+            Assert(
+                snapshot.GpuSelectionStatus == GpuSelectionStatus.ManualSelected,
+                "matched manual GPU was not selected");
+            Assert(snapshot.BarUsesIntegratedGpu, "matched manual iGPU was ignored");
+
+            snapshot.DiscreteGpuSelectionMatched = false;
+            snapshot.IntegratedGpuSelectionMatched = false;
+            HardwareSampler.ResolveGpuSelection(
+                snapshot,
+                GpuSelectionMode.Manual,
+                "missing-adapter",
+                "Removed GPU");
+            Assert(
+                snapshot.GpuSelectionStatus == GpuSelectionStatus.ManualUnavailableFallback,
+                "missing manual GPU did not report an automatic fallback");
+            Assert(!snapshot.BarUsesIntegratedGpu, "manual fallback did not use normal automatic selection");
+
+            GpuAdapterChoice integrated = new GpuAdapterChoice(
+                "i",
+                "Integrated GPU",
+                GpuRoleSampler.IntelVendorId,
+                GpuAdapterRole.Integrated);
+            GpuAdapterChoice discrete = new GpuAdapterChoice(
+                "d",
+                "Discrete GPU",
+                GpuRoleSampler.NvidiaVendorId,
+                GpuAdapterRole.Discrete);
+            Assert(
+                GpuRoleSampler.CompareAdapterChoices(discrete, integrated) < 0,
+                "GPU choices no longer put the discrete adapter first");
+            Assert(
+                discrete.ToString().IndexOf("独立显卡", StringComparison.Ordinal) >= 0 &&
+                integrated.ToString().IndexOf("核显", StringComparison.Ordinal) >= 0,
+                "GPU choices do not show their roles");
         }
 
         private static void TestLoopbackGpuStatusSchema()
@@ -940,6 +2410,75 @@ namespace TinyHwBar.Tests
                     });
                 Assert(opacity != null && opacity.TabIndex == 0, "opacity keyboard control is missing");
 
+                RadioButton automaticGpu = FindFirstControl<RadioButton>(
+                    dashboard,
+                    delegate(RadioButton control)
+                    {
+                        return control.AccessibleName == "GPU 自动选择（推荐）";
+                    });
+                RadioButton manualGpu = FindFirstControl<RadioButton>(
+                    dashboard,
+                    delegate(RadioButton control)
+                    {
+                        return control.AccessibleName == "GPU 手动选择";
+                    });
+                ComboBox gpuAdapter = FindFirstControl<ComboBox>(
+                    dashboard,
+                    delegate(ComboBox control)
+                    {
+                        return control.AccessibleName == "手动选择 GPU 设备";
+                    });
+                Button refreshGpu = FindFirstControl<Button>(
+                    dashboard,
+                    delegate(Button control)
+                    {
+                        return control.AccessibleName == "刷新 GPU 设备列表";
+                    });
+                Label gpuSelectionStatus = FindFirstControl<Label>(
+                    dashboard,
+                    delegate(Label control)
+                    {
+                        return control.AccessibleName == "GPU 选择状态";
+                    });
+                Assert(
+                    automaticGpu != null && automaticGpu.Checked &&
+                    automaticGpu.TabIndex == 0,
+                    "recommended automatic GPU selection is not the dashboard default");
+                Assert(
+                    manualGpu != null && !manualGpu.Checked &&
+                    manualGpu.TabIndex == 1,
+                    "manual GPU selection is enabled by default or missing");
+                Assert(
+                    gpuAdapter != null &&
+                    gpuAdapter.DropDownStyle == ComboBoxStyle.DropDownList &&
+                    !gpuAdapter.Enabled &&
+                    gpuAdapter.TabIndex == 2,
+                    "manual GPU list is not present and disabled in automatic mode");
+                Assert(
+                    refreshGpu != null && refreshGpu.Enabled &&
+                    refreshGpu.TabIndex == 3,
+                    "GPU device refresh action is missing");
+                Assert(
+                    gpuSelectionStatus != null &&
+                    gpuSelectionStatus.Text.IndexOf(
+                        "自动模式",
+                        StringComparison.Ordinal) >= 0,
+                    "automatic GPU selection status is not explained");
+
+                dashboard.UpdateSnapshot(new HardwareSnapshot
+                {
+                    GpuSelectionMode = GpuSelectionMode.Automatic,
+                    GpuSelectionStatus = GpuSelectionStatus.Automatic,
+                    EffectiveGpuAdapterName = "Automatic Test GPU"
+                });
+                Assert(
+                    gpuSelectionStatus.Text == "当前自动使用：Automatic Test GPU",
+                    "automatic GPU effective-device status was not updated");
+                manualGpu.Checked = true;
+                Assert(
+                    gpuAdapter.Enabled && !automaticGpu.Checked,
+                    "manual mode did not enable the GPU device list");
+
                 Assert(
                     FindCheckBox(dashboard, "保存最近 900 个指标点到本机").Checked,
                     "history persistence is not enabled in the default dashboard");
@@ -957,9 +2496,63 @@ namespace TinyHwBar.Tests
                 Assert(
                     !FindCheckBox(dashboard, "启用仅限本机的状态 API").Checked,
                     "loopback API is enabled in the default dashboard");
+                CheckBox telemetryToggle = FindCheckBox(
+                    dashboard,
+                    "允许逐次确认的遥测/诊断摘要发送");
                 Assert(
-                    !FindCheckBox(dashboard, "允许逐次确认的遥测/诊断摘要发送").Checked,
+                    !telemetryToggle.Checked,
                     "telemetry is enabled in the default dashboard");
+                Assert(
+                    telemetryToggle is GrayscaleTextCheckBox &&
+                    telemetryToggle.UseCompatibleTextRendering &&
+                    telemetryToggle.AutoSize &&
+                    telemetryToggle.MinimumSize == telemetryToggle.MaximumSize &&
+                    telemetryToggle.PreferredSize == telemetryToggle.MinimumSize,
+                    "telemetry checkbox rendering changed its original layout contract");
+                GrayscaleTextLabel telemetryStatus =
+                    FindFirstControl<GrayscaleTextLabel>(dashboard, null);
+                Assert(
+                    telemetryStatus != null &&
+                    telemetryStatus.UseCompatibleTextRendering &&
+                    telemetryStatus.AutoSize &&
+                    telemetryStatus.MinimumSize.Height ==
+                        telemetryStatus.MaximumSize.Height &&
+                    telemetryStatus.PreferredSize.Height ==
+                        telemetryStatus.MinimumSize.Height,
+                    "telemetry status rendering changed its original row height");
+                using (CheckBox baselineTelemetryToggle = new CheckBox())
+                {
+                    baselineTelemetryToggle.UseCompatibleTextRendering = false;
+                    baselineTelemetryToggle.Font = telemetryToggle.Font;
+                    baselineTelemetryToggle.Text = telemetryToggle.Text;
+                    baselineTelemetryToggle.AutoSize = true;
+                    Assert(
+                        telemetryToggle.Font.Name == "Segoe UI" &&
+                        telemetryToggle.PreferredSize ==
+                            baselineTelemetryToggle.GetPreferredSize(Size.Empty),
+                        "dashboard telemetry checkbox was sized before inheriting its UI font");
+                }
+
+                using (Label baselineTelemetryStatus = new Label())
+                {
+                    baselineTelemetryStatus.UseCompatibleTextRendering = false;
+                    baselineTelemetryStatus.Font = telemetryStatus.Font;
+                    baselineTelemetryStatus.Text = telemetryStatus.Text;
+                    baselineTelemetryStatus.AutoSize = true;
+                    Assert(
+                        telemetryStatus.Font.Name == "Segoe UI" &&
+                        telemetryStatus.PreferredSize.Height ==
+                            baselineTelemetryStatus.GetPreferredSize(Size.Empty).Height,
+                        "dashboard telemetry status was sized before inheriting its UI font");
+                }
+                int telemetryStatusHeight = telemetryStatus.PreferredSize.Height;
+                dashboard.SetTelemetryStatus(
+                    "可发送状态已启用；每次发送仍需预览并明确确认。");
+                Assert(
+                    telemetryStatus.Text ==
+                        "可发送状态已启用；每次发送仍需预览并明确确认。" &&
+                    telemetryStatus.PreferredSize.Height == telemetryStatusHeight,
+                    "dynamic telemetry status changed the preserved single-line row height");
 
                 TextBox updateEndpoint = FindFirstControl<TextBox>(
                     dashboard,
@@ -1040,6 +2633,392 @@ namespace TinyHwBar.Tests
                     adapterStatus,
                     NetworkSelectionStatus.Disposed,
                     "网络采样已停止");
+            }
+        }
+
+        private static void TestTelemetryTextRendering()
+        {
+            const string checkBoxText =
+                "允许逐次确认的遥测/诊断摘要发送";
+            const string statusText = "未发送任何遥测或诊断数据";
+
+            using (Font font = new Font(
+                "Segoe UI",
+                9.0f,
+                FontStyle.Regular,
+                GraphicsUnit.Point))
+            using (CheckBox baselineCheckBox = new CheckBox())
+            using (GrayscaleTextCheckBox grayscaleCheckBox =
+                new GrayscaleTextCheckBox())
+            {
+                baselineCheckBox.UseCompatibleTextRendering = false;
+                baselineCheckBox.Font = font;
+                baselineCheckBox.Text = checkBoxText;
+                baselineCheckBox.AutoSize = true;
+
+                grayscaleCheckBox.Font = font;
+                grayscaleCheckBox.Text = checkBoxText;
+                grayscaleCheckBox.AutoSize = true;
+                Size originalPreferredSize =
+                    baselineCheckBox.GetPreferredSize(Size.Empty);
+                grayscaleCheckBox.EnableGrayscaleTextRendering();
+
+                Assert(
+                    grayscaleCheckBox.AutoSize &&
+                    grayscaleCheckBox.PreferredSize == originalPreferredSize &&
+                    grayscaleCheckBox.Size == originalPreferredSize,
+                    "grayscale checkbox changed the original GDI preferred size");
+
+                int checkedChanges = 0;
+                grayscaleCheckBox.CheckedChanged += delegate
+                {
+                    checkedChanges++;
+                };
+                grayscaleCheckBox.Checked = true;
+                grayscaleCheckBox.Checked = false;
+                Assert(
+                    checkedChanges == 2,
+                    "grayscale checkbox changed the normal checked-state behavior");
+
+                grayscaleCheckBox.BackColor = Color.White;
+                grayscaleCheckBox.ForeColor = Color.Black;
+                using (Bitmap bitmap = new Bitmap(
+                    grayscaleCheckBox.Width,
+                    grayscaleCheckBox.Height))
+                {
+                    grayscaleCheckBox.DrawToBitmap(
+                        bitmap,
+                        new Rectangle(Point.Empty, bitmap.Size));
+                    Rectangle inkBounds = GetInkBounds(
+                        bitmap,
+                        new Rectangle(
+                            20,
+                            0,
+                            Math.Max(0, bitmap.Width - 20),
+                            bitmap.Height));
+                    Assert(
+                        CountChromaticPixels(
+                            bitmap,
+                            new Rectangle(
+                                20,
+                                0,
+                                Math.Max(0, bitmap.Width - 20),
+                                bitmap.Height)) == 0,
+                        "grayscale checkbox text still contains RGB subpixel fringes");
+                    Assert(
+                        !inkBounds.IsEmpty &&
+                        inkBounds.Top > 0 &&
+                        inkBounds.Right < bitmap.Width &&
+                        inkBounds.Bottom < bitmap.Height,
+                        "grayscale checkbox text is missing or clipped");
+                }
+            }
+
+            using (Font font = new Font(
+                "Segoe UI",
+                9.0f,
+                FontStyle.Regular,
+                GraphicsUnit.Point))
+            using (Label baselineLabel = new Label())
+            using (GrayscaleTextLabel unconstrainedLabel =
+                new GrayscaleTextLabel())
+            using (GrayscaleTextLabel grayscaleLabel = new GrayscaleTextLabel())
+            {
+                baselineLabel.UseCompatibleTextRendering = false;
+                baselineLabel.Font = font;
+                baselineLabel.Text = statusText;
+                baselineLabel.AutoSize = true;
+
+                grayscaleLabel.Font = font;
+                grayscaleLabel.Text = statusText;
+                grayscaleLabel.AutoSize = true;
+                unconstrainedLabel.Font = font;
+                unconstrainedLabel.Text = statusText;
+                unconstrainedLabel.AutoSize = true;
+                unconstrainedLabel.UseCompatibleTextRendering = true;
+                int originalPreferredHeight =
+                    baselineLabel.GetPreferredSize(Size.Empty).Height;
+                grayscaleLabel.EnableGrayscaleTextRendering();
+
+                Assert(
+                    grayscaleLabel.AutoSize &&
+                    grayscaleLabel.PreferredSize.Height == originalPreferredHeight,
+                    "grayscale status label changed the original GDI row height");
+
+                grayscaleLabel.BackColor = Color.White;
+                grayscaleLabel.ForeColor = Color.Black;
+                grayscaleLabel.Size = new Size(
+                    baselineLabel.GetPreferredSize(Size.Empty).Width,
+                    originalPreferredHeight);
+                unconstrainedLabel.BackColor = Color.White;
+                unconstrainedLabel.ForeColor = Color.Black;
+                unconstrainedLabel.Size = unconstrainedLabel.GetPreferredSize(
+                    Size.Empty);
+                using (Bitmap bitmap = new Bitmap(
+                    grayscaleLabel.Width,
+                    grayscaleLabel.Height))
+                using (Bitmap unconstrainedBitmap = new Bitmap(
+                    unconstrainedLabel.Width,
+                    unconstrainedLabel.Height))
+                {
+                    grayscaleLabel.DrawToBitmap(
+                        bitmap,
+                        new Rectangle(Point.Empty, bitmap.Size));
+                    unconstrainedLabel.DrawToBitmap(
+                        unconstrainedBitmap,
+                        new Rectangle(Point.Empty, unconstrainedBitmap.Size));
+                    Rectangle inkBounds = GetInkBounds(
+                        bitmap,
+                        new Rectangle(Point.Empty, bitmap.Size));
+                    Rectangle unconstrainedInkBounds = GetInkBounds(
+                        unconstrainedBitmap,
+                        new Rectangle(Point.Empty, unconstrainedBitmap.Size));
+                    Assert(
+                        CountChromaticPixels(
+                            bitmap,
+                            new Rectangle(Point.Empty, bitmap.Size)) == 0,
+                        "grayscale status text still contains RGB subpixel fringes");
+                    Assert(
+                        !inkBounds.IsEmpty &&
+                        inkBounds.Size == unconstrainedInkBounds.Size,
+                        "grayscale status text is missing or clipped at the preserved row height");
+                }
+
+                grayscaleLabel.Text =
+                    "可发送状态已启用；每次发送仍需预览并明确确认。";
+                Assert(
+                    grayscaleLabel.PreferredSize.Height == originalPreferredHeight,
+                    "long dynamic telemetry status changed the preserved row height");
+                using (Bitmap longStatusBitmap = new Bitmap(
+                    grayscaleLabel.Width,
+                    grayscaleLabel.Height))
+                {
+                    grayscaleLabel.DrawToBitmap(
+                        longStatusBitmap,
+                        new Rectangle(Point.Empty, longStatusBitmap.Size));
+                    Assert(
+                        !GetInkBounds(
+                            longStatusBitmap,
+                            new Rectangle(
+                                Point.Empty,
+                                longStatusBitmap.Size)).IsEmpty,
+                        "long dynamic telemetry status was not rendered");
+                }
+            }
+        }
+
+        private static int CountChromaticPixels(Bitmap bitmap, Rectangle bounds)
+        {
+            Rectangle clipped = Rectangle.Intersect(
+                new Rectangle(Point.Empty, bitmap.Size),
+                bounds);
+            int count = 0;
+            for (int y = clipped.Top; y < clipped.Bottom; y++)
+            {
+                for (int x = clipped.Left; x < clipped.Right; x++)
+                {
+                    Color pixel = bitmap.GetPixel(x, y);
+                    int maximum = Math.Max(pixel.R, Math.Max(pixel.G, pixel.B));
+                    int minimum = Math.Min(pixel.R, Math.Min(pixel.G, pixel.B));
+                    if (maximum - minimum > 6)
+                    {
+                        count++;
+                    }
+                }
+            }
+
+            return count;
+        }
+
+        private static Rectangle GetInkBounds(Bitmap bitmap, Rectangle bounds)
+        {
+            Rectangle clipped = Rectangle.Intersect(
+                new Rectangle(Point.Empty, bitmap.Size),
+                bounds);
+            int left = clipped.Right;
+            int top = clipped.Bottom;
+            int right = clipped.Left - 1;
+            int bottom = clipped.Top - 1;
+            for (int y = clipped.Top; y < clipped.Bottom; y++)
+            {
+                for (int x = clipped.Left; x < clipped.Right; x++)
+                {
+                    Color pixel = bitmap.GetPixel(x, y);
+                    if (pixel.R < 245 || pixel.G < 245 || pixel.B < 245)
+                    {
+                        left = Math.Min(left, x);
+                        top = Math.Min(top, y);
+                        right = Math.Max(right, x);
+                        bottom = Math.Max(bottom, y);
+                    }
+                }
+            }
+
+            return right < left || bottom < top
+                ? Rectangle.Empty
+                : Rectangle.FromLTRB(left, top, right + 1, bottom + 1);
+        }
+
+        private static void TestDashboardWorkingAreaConstraint()
+        {
+            Rectangle workingArea = new Rectangle(0, 0, 1920, 1040);
+            Rectangle oversized = DashboardForm.ConstrainToWorkingArea(
+                new Rectangle(-200, -100, 2200, 1300),
+                workingArea,
+                12);
+            Assert(oversized.Left == 12 && oversized.Top == 12, "oversized dashboard was not repositioned");
+            Assert(
+                oversized.Right == workingArea.Right - 12 &&
+                oversized.Bottom == workingArea.Bottom - 12,
+                "oversized dashboard was not capped to the working area");
+
+            Rectangle shiftedWorkArea = new Rectangle(1920, -200, 1280, 1000);
+            Rectangle offscreen = DashboardForm.ConstrainToWorkingArea(
+                new Rectangle(0, -500, 760, 560),
+                shiftedWorkArea,
+                12);
+            Assert(
+                shiftedWorkArea.Contains(offscreen),
+                "dashboard was not moved into a shifted monitor working area");
+        }
+
+        private static void TestDashboardDirtySettingsPreserved()
+        {
+            AppSettings initial = AppSettings.CreateDefault();
+            using (DashboardForm dashboard = new DashboardForm(initial, new MetricHistory()))
+            {
+                CheckBox locked = FindCheckBox(dashboard, "锁定监控条位置");
+                CheckBox history = FindCheckBox(dashboard, "保存最近 900 个指标点到本机");
+                CheckBox startup = FindCheckBox(dashboard, "登录 Windows 后启动 TinyHwBar");
+                ComboBox opacity = FindFirstControl<ComboBox>(
+                    dashboard,
+                    delegate(ComboBox control)
+                    {
+                        return control.AccessibleName == "监控条透明度";
+                    });
+                TextBox updateEndpoint = FindFirstControl<TextBox>(
+                    dashboard,
+                    delegate(TextBox control)
+                    {
+                        return control.AccessibleName == "更新清单 HTTPS 地址";
+                    });
+                Assert(opacity != null, "opacity editor is missing");
+                Assert(updateEndpoint != null, "update endpoint editor is missing");
+
+                locked.Checked = true;
+                startup.Checked = true;
+                updateEndpoint.Text = "https://draft.example.invalid/manifest.ini";
+
+                AppSettings runtime = AppSettings.CreateDefault();
+                runtime.Locked = false;
+                runtime.OpacityPercent = 60;
+                runtime.PersistHistory = false;
+                runtime.StartupEnabled = false;
+                runtime.UpdateManifestUrl = "https://saved.example.invalid/manifest.ini";
+                dashboard.SyncSettings(runtime);
+
+                Assert(locked.Checked, "runtime sync overwrote a dirty display edit");
+                Assert(
+                    opacity.SelectedItem != null && opacity.SelectedItem.ToString() == "60%",
+                    "clean opacity field did not follow runtime state");
+                Assert(startup.Checked, "runtime sync overwrote a dirty startup edit");
+                Assert(
+                    updateEndpoint.Text == "https://draft.example.invalid/manifest.ini",
+                    "runtime sync overwrote a dirty endpoint edit");
+                Assert(!history.Checked, "runtime sync did not update a clean history field");
+
+                dashboard.SetStartupState(false, "test status");
+                Assert(startup.Checked, "startup status refresh overwrote a dirty startup edit");
+
+                dashboard.RefreshSettings(runtime);
+                Assert(!locked.Checked, "explicit refresh did not accept the saved display value");
+                Assert(!startup.Checked, "explicit refresh did not accept the saved startup value");
+                Assert(
+                    updateEndpoint.Text == "https://saved.example.invalid/manifest.ini",
+                    "explicit refresh did not accept the saved endpoint");
+
+                AppSettings nextRuntime = runtime.Clone();
+                nextRuntime.Locked = true;
+                nextRuntime.PersistHistory = true;
+                nextRuntime.StartupEnabled = true;
+                nextRuntime.UpdateManifestUrl = "https://next.example.invalid/manifest.ini";
+                dashboard.SyncSettings(nextRuntime);
+                Assert(locked.Checked, "clean display field did not follow runtime state");
+                Assert(history.Checked, "clean history field did not follow runtime state");
+                Assert(startup.Checked, "clean startup field did not follow runtime state");
+                Assert(
+                    updateEndpoint.Text == "https://next.example.invalid/manifest.ini",
+                    "clean endpoint field did not follow runtime state");
+            }
+        }
+
+        private static void TestDashboardMissingManualGpuFallback()
+        {
+            AppSettings settings = AppSettings.CreateDefault();
+            settings.GpuSelectionMode = GpuSelectionMode.Manual;
+            settings.SelectedGpuAdapterId = "FFFFFFFF:FFFFFFFF";
+            settings.SelectedGpuAdapterName = "TinyHwBar Missing Test GPU";
+
+            using (DashboardForm dashboard = new DashboardForm(settings, new MetricHistory()))
+            {
+                RadioButton manualGpu = FindFirstControl<RadioButton>(
+                    dashboard,
+                    delegate(RadioButton control)
+                    {
+                        return control.AccessibleName == "GPU 手动选择";
+                    });
+                ComboBox gpuAdapter = FindFirstControl<ComboBox>(
+                    dashboard,
+                    delegate(ComboBox control)
+                    {
+                        return control.AccessibleName == "手动选择 GPU 设备";
+                    });
+                Button refreshGpu = FindFirstControl<Button>(
+                    dashboard,
+                    delegate(Button control)
+                    {
+                        return control.AccessibleName == "刷新 GPU 设备列表";
+                    });
+                Label status = FindFirstControl<Label>(
+                    dashboard,
+                    delegate(Label control)
+                    {
+                        return control.AccessibleName == "GPU 选择状态";
+                    });
+
+                Assert(manualGpu != null && manualGpu.Checked, "saved manual GPU mode was not restored");
+                Assert(
+                    gpuAdapter != null && gpuAdapter.Enabled &&
+                    gpuAdapter.SelectedItem != null &&
+                    gpuAdapter.SelectedItem.ToString().IndexOf(
+                        "当前不可用",
+                        StringComparison.Ordinal) >= 0,
+                    "missing manual GPU was not retained as an unavailable choice");
+                Assert(
+                    status != null &&
+                    status.Text.IndexOf("临时回退自动选择", StringComparison.Ordinal) >= 0,
+                    "missing manual GPU fallback is not explained");
+
+                dashboard.UpdateSnapshot(new HardwareSnapshot
+                {
+                    GpuSelectionMode = GpuSelectionMode.Manual,
+                    GpuSelectionStatus = GpuSelectionStatus.ManualUnavailableFallback,
+                    RequestedGpuAdapterId = settings.SelectedGpuAdapterId,
+                    RequestedGpuAdapterName = settings.SelectedGpuAdapterName,
+                    EffectiveGpuAdapterName = "Fallback GPU"
+                });
+                Assert(
+                    status.Text.IndexOf("临时回退自动选择", StringComparison.Ordinal) >= 0,
+                    "runtime manual GPU fallback status was lost");
+
+                Assert(refreshGpu != null, "GPU refresh button is missing");
+                refreshGpu.PerformClick();
+                Assert(
+                    gpuAdapter.SelectedItem != null &&
+                    gpuAdapter.SelectedItem.ToString().IndexOf(
+                        "当前不可用",
+                        StringComparison.Ordinal) >= 0,
+                    "refresh discarded the unavailable saved GPU identity");
             }
         }
 

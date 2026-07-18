@@ -12,6 +12,13 @@ namespace TinyHwBar
         Unavailable
     }
 
+    internal enum GpuSelectionStatus
+    {
+        Automatic,
+        ManualSelected,
+        ManualUnavailableFallback
+    }
+
     internal sealed class HardwareSnapshot
     {
         internal HardwareSnapshot()
@@ -28,6 +35,8 @@ namespace TinyHwBar
             IntegratedUtilizationStatus = IntelGpuDataStatus.NotFound;
             IntegratedMemoryStatus = IntelGpuDataStatus.NotFound;
             IntegratedTemperatureStatus = IntelGpuDataStatus.Unsupported;
+            GpuSelectionMode = GpuSelectionMode.Automatic;
+            GpuSelectionStatus = GpuSelectionStatus.Automatic;
         }
 
         internal DateTime SampledAtUtc { get; set; }
@@ -39,6 +48,8 @@ namespace TinyHwBar
         internal int? TemperatureCelsius { get; set; }
         internal bool DiscreteGpuDetected { get; set; }
         internal string DiscreteGpuName { get; set; }
+        internal string DiscreteGpuId { get; set; }
+        internal bool DiscreteGpuSelectionMatched { get; set; }
         internal uint? DiscreteGpuVendorId { get; set; }
         internal long? DiscreteMemoryBytes { get; set; }
         internal long? DiscreteMemoryLimitBytes { get; set; }
@@ -56,6 +67,8 @@ namespace TinyHwBar
         internal GatewayLatencyStatus GatewayLatencyStatus { get; set; }
         internal bool IntegratedGpuDetected { get; set; }
         internal string IntegratedGpuName { get; set; }
+        internal string IntegratedGpuId { get; set; }
+        internal bool IntegratedGpuSelectionMatched { get; set; }
         internal uint? IntegratedGpuVendorId { get; set; }
         internal int? IntegratedGpuPercent { get; set; }
         internal long? IntegratedDedicatedMemoryBytes { get; set; }
@@ -66,6 +79,13 @@ namespace TinyHwBar
         internal IntelGpuDataStatus IntegratedUtilizationStatus { get; set; }
         internal IntelGpuDataStatus IntegratedMemoryStatus { get; set; }
         internal IntelGpuDataStatus IntegratedTemperatureStatus { get; set; }
+        internal GpuSelectionMode GpuSelectionMode { get; set; }
+        internal GpuSelectionStatus GpuSelectionStatus { get; set; }
+        internal string RequestedGpuAdapterId { get; set; }
+        internal string RequestedGpuAdapterName { get; set; }
+        internal string EffectiveGpuAdapterId { get; set; }
+        internal string EffectiveGpuAdapterName { get; set; }
+        internal bool BarUsesIntegratedGpu { get; set; }
 
         internal string ToDisplayText()
         {
@@ -74,8 +94,20 @@ namespace TinyHwBar
             string gpu;
             string videoMemory;
             string temperature;
+            string gpuLabel = BarUsesIntegratedGpu ? "iGPU" : "GPU";
 
-            if (GpuMode == GpuDisplayMode.Eco)
+            if (BarUsesIntegratedGpu)
+            {
+                gpu = FormatPercent(IntegratedGpuPercent);
+                videoMemory = FormatPercent(CalculatePercentage(
+                    IntegratedSharedMemoryBytes,
+                    IntegratedSharedMemoryLimitBytes) ??
+                    CalculatePercentage(
+                        IntegratedDedicatedMemoryBytes,
+                        IntegratedDedicatedMemoryLimitBytes));
+                temperature = "--°";
+            }
+            else if (GpuMode == GpuDisplayMode.Eco)
             {
                 gpu = "ECO";
                 videoMemory = "--";
@@ -98,12 +130,33 @@ namespace TinyHwBar
 
             return string.Format(
                 CultureInfo.InvariantCulture,
-                "CPU {0} · RAM {1} · GPU {2} · VR {3} · {4}",
+                "CPU {0} · RAM {1} · {2} {3} · VR {4} · {5}",
                 cpu,
                 memory,
+                gpuLabel,
                 gpu,
                 videoMemory,
                 temperature);
+        }
+
+        private static int? CalculatePercentage(long? usage, long? limit)
+        {
+            if (!usage.HasValue || !limit.HasValue || limit.Value <= 0)
+            {
+                return null;
+            }
+
+            double percentage = usage.Value * 100.0 / limit.Value;
+            if (percentage < 0.0)
+            {
+                return 0;
+            }
+
+            return percentage > 100.0
+                ? 100
+                : (int)Math.Round(
+                    percentage,
+                    MidpointRounding.AwayFromZero);
         }
 
         private static string FormatPercent(int? value)
@@ -138,6 +191,9 @@ namespace TinyHwBar
         private uint? selectedNvmlAdapterLuidLowPart;
         private int? selectedNvmlAdapterLuidHighPart;
         private DateTime nextNvmlRetryUtc = DateTime.MinValue;
+        private GpuSelectionMode gpuSelectionMode = GpuSelectionMode.Automatic;
+        private string selectedGpuAdapterId = string.Empty;
+        private string selectedGpuAdapterName = string.Empty;
 
         internal HardwareSampler()
         {
@@ -178,6 +234,7 @@ namespace TinyHwBar
                 SampleDiscreteGpu(acLineStatus, snapshot);
                 SampleNetwork(snapshot);
                 SampleIntegratedGpu(snapshot);
+                ResolveGpuSelection(snapshot);
 
                 snapshot.SampledAtUtc = DateTime.UtcNow;
                 return snapshot;
@@ -249,6 +306,122 @@ namespace TinyHwBar
             }
         }
 
+        private void ResolveGpuSelection(HardwareSnapshot snapshot)
+        {
+            ResolveGpuSelection(
+                snapshot,
+                gpuSelectionMode,
+                selectedGpuAdapterId,
+                selectedGpuAdapterName);
+        }
+
+        internal static void ResolveGpuSelection(
+            HardwareSnapshot snapshot,
+            GpuSelectionMode selectionMode,
+            string requestedAdapterId,
+            string requestedAdapterName)
+        {
+            if (snapshot == null)
+            {
+                throw new ArgumentNullException("snapshot");
+            }
+
+            snapshot.GpuSelectionMode = selectionMode;
+            snapshot.RequestedGpuAdapterId = requestedAdapterId ?? string.Empty;
+            snapshot.RequestedGpuAdapterName = requestedAdapterName ?? string.Empty;
+
+            if (selectionMode == GpuSelectionMode.Manual)
+            {
+                if (snapshot.DiscreteGpuDetected &&
+                    snapshot.DiscreteGpuSelectionMatched)
+                {
+                    snapshot.GpuSelectionStatus = GpuSelectionStatus.ManualSelected;
+                    snapshot.EffectiveGpuAdapterId = snapshot.DiscreteGpuId;
+                    snapshot.EffectiveGpuAdapterName = snapshot.DiscreteGpuName;
+                    snapshot.BarUsesIntegratedGpu = false;
+                    return;
+                }
+
+                if (snapshot.IntegratedGpuDetected &&
+                    snapshot.IntegratedGpuSelectionMatched)
+                {
+                    snapshot.GpuSelectionStatus = GpuSelectionStatus.ManualSelected;
+                    snapshot.EffectiveGpuAdapterId = snapshot.IntegratedGpuId;
+                    snapshot.EffectiveGpuAdapterName = snapshot.IntegratedGpuName;
+                    snapshot.BarUsesIntegratedGpu = true;
+                    return;
+                }
+
+                snapshot.GpuSelectionStatus =
+                    GpuSelectionStatus.ManualUnavailableFallback;
+            }
+            else
+            {
+                snapshot.GpuSelectionStatus = GpuSelectionStatus.Automatic;
+            }
+
+            bool useIntegrated = snapshot.IntegratedGpuDetected &&
+                (snapshot.GpuMode != GpuDisplayMode.Available ||
+                 !snapshot.GpuPercent.HasValue);
+            snapshot.BarUsesIntegratedGpu = useIntegrated;
+            if (useIntegrated)
+            {
+                snapshot.EffectiveGpuAdapterId = snapshot.IntegratedGpuId;
+                snapshot.EffectiveGpuAdapterName = snapshot.IntegratedGpuName;
+            }
+            else if (snapshot.DiscreteGpuDetected)
+            {
+                snapshot.EffectiveGpuAdapterId = snapshot.DiscreteGpuId;
+                snapshot.EffectiveGpuAdapterName = snapshot.DiscreteGpuName;
+            }
+        }
+
+        internal void SetGpuSelection(
+            GpuSelectionMode mode,
+            string adapterId,
+            string adapterName)
+        {
+            lock (synchronization)
+            {
+                if (disposed)
+                {
+                    return;
+                }
+
+                string normalizedAdapterId = mode == GpuSelectionMode.Manual &&
+                    !string.IsNullOrWhiteSpace(adapterId)
+                    ? adapterId.Trim()
+                    : string.Empty;
+                gpuSelectionMode = normalizedAdapterId.Length == 0
+                    ? GpuSelectionMode.Automatic
+                    : GpuSelectionMode.Manual;
+                selectedGpuAdapterId = normalizedAdapterId;
+                selectedGpuAdapterName = gpuSelectionMode == GpuSelectionMode.Manual &&
+                    !string.IsNullOrWhiteSpace(adapterName)
+                    ? adapterName.Trim()
+                    : string.Empty;
+
+                discreteGpuSampler.SetPreferredAdapter(
+                    selectedGpuAdapterId,
+                    selectedGpuAdapterName);
+                integratedGpuSampler.SetPreferredAdapter(
+                    selectedGpuAdapterId,
+                    selectedGpuAdapterName);
+                ShutdownNvmlSafely();
+                nextNvmlRetryUtc = DateTime.MinValue;
+            }
+        }
+
+        internal GpuAdapterChoice[] GetGpuAdapterChoices()
+        {
+            lock (synchronization)
+            {
+                return disposed
+                    ? new GpuAdapterChoice[0]
+                    : GpuRoleSampler.GetAdapterChoices();
+            }
+        }
+
         internal static void ApplyIntegratedGpuMetrics(
             HardwareSnapshot snapshot,
             IntelGpuMetrics metrics)
@@ -265,6 +438,7 @@ namespace TinyHwBar
 
             snapshot.IntegratedGpuDetected = false;
             snapshot.IntegratedGpuName = null;
+            snapshot.IntegratedGpuId = null;
             snapshot.IntegratedGpuVendorId = null;
             snapshot.IntegratedGpuPercent = null;
             snapshot.IntegratedDedicatedMemoryBytes = null;
@@ -272,6 +446,8 @@ namespace TinyHwBar
             snapshot.IntegratedSharedMemoryBytes = null;
             snapshot.IntegratedSharedMemoryLimitBytes = null;
             snapshot.IntegratedGpuDetected = metrics.IsAvailable;
+            snapshot.IntegratedGpuSelectionMatched =
+                metrics.PreferredSelectionMatched;
             snapshot.IntegratedAdapterStatus = metrics.AdapterStatus;
             snapshot.IntegratedUtilizationStatus = metrics.UtilizationStatus;
             snapshot.IntegratedMemoryStatus = metrics.MemoryStatus;
@@ -283,6 +459,7 @@ namespace TinyHwBar
             }
 
             snapshot.IntegratedGpuName = metrics.AdapterName;
+            snapshot.IntegratedGpuId = metrics.AdapterId;
             snapshot.IntegratedGpuVendorId = metrics.AdapterVendorId;
             snapshot.IntegratedGpuPercent = metrics.UtilizationPercent;
             snapshot.IntegratedDedicatedMemoryBytes = metrics.DedicatedMemoryUsageBytes;
@@ -458,6 +635,7 @@ namespace TinyHwBar
 
             snapshot.DiscreteGpuDetected = false;
             snapshot.DiscreteGpuName = null;
+            snapshot.DiscreteGpuId = null;
             snapshot.DiscreteGpuVendorId = null;
             snapshot.DiscreteMemoryBytes = null;
             snapshot.DiscreteMemoryLimitBytes = null;
@@ -465,6 +643,8 @@ namespace TinyHwBar
             snapshot.VideoMemoryPercent = null;
             snapshot.TemperatureCelsius = null;
             snapshot.DiscreteGpuDetected = metrics.IsAvailable;
+            snapshot.DiscreteGpuSelectionMatched =
+                metrics.PreferredSelectionMatched;
             snapshot.DiscreteAdapterStatus = metrics.AdapterStatus;
             snapshot.DiscreteUtilizationStatus = metrics.UtilizationStatus;
             snapshot.DiscreteMemoryStatus = metrics.MemoryStatus;
@@ -477,6 +657,7 @@ namespace TinyHwBar
             }
 
             snapshot.DiscreteGpuName = metrics.AdapterName;
+            snapshot.DiscreteGpuId = metrics.AdapterId;
             snapshot.DiscreteGpuVendorId = metrics.AdapterVendorId;
             snapshot.DiscreteMemoryBytes = metrics.DedicatedMemoryUsageBytes;
             snapshot.DiscreteMemoryLimitBytes = metrics.DedicatedMemoryLimitBytes;

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
@@ -14,6 +15,9 @@ namespace TinyHwBar
         private const float OuterMargin = 12.0f;
         private const float AxisLabelWidth = 34.0f;
         private const float BottomLabelHeight = 24.0f;
+        private const float MinimumPlotDimension = 40.0f;
+        private const float MinimumConnectionGapSeconds = 10.0f;
+        private const float MaximumConnectionGapSeconds = 60.0f;
 
         private static readonly HistoryPoint[] EmptyPoints = new HistoryPoint[0];
 
@@ -78,6 +82,7 @@ namespace TinyHwBar
             {
                 HistoryPoint[] copy = new HistoryPoint[historyPoints.Length];
                 Array.Copy(historyPoints, copy, historyPoints.Length);
+                Array.Sort(copy, CompareHistoryPoints);
                 points = copy;
             }
 
@@ -92,22 +97,33 @@ namespace TinyHwBar
             graphics.Clear(BackColor);
             graphics.SmoothingMode = SmoothingMode.AntiAlias;
 
-            float legendBottom = DrawLegend(graphics);
+            float dpiScale = GetDpiScale(graphics);
+            UpdatePenWidths(dpiScale);
+            float outerMargin = OuterMargin * dpiScale;
+            float axisLabelWidth = AxisLabelWidth * dpiScale;
+            float bottomLabelHeight = BottomLabelHeight * dpiScale;
+            float legendBottom = DrawLegend(graphics, dpiScale, outerMargin);
             RectangleF plotBounds = new RectangleF(
-                OuterMargin + AxisLabelWidth,
+                outerMargin + axisLabelWidth,
                 legendBottom,
-                Math.Max(0.0f, ClientSize.Width - (OuterMargin * 2.0f) - AxisLabelWidth),
+                Math.Max(0.0f, ClientSize.Width - (outerMargin * 2.0f) - axisLabelWidth),
                 Math.Max(
                     0.0f,
-                    ClientSize.Height - legendBottom - BottomLabelHeight - OuterMargin));
+                    ClientSize.Height - legendBottom - bottomLabelHeight - outerMargin));
 
-            if (plotBounds.Width < 40.0f || plotBounds.Height < 40.0f)
+            if (plotBounds.Width < MinimumPlotDimension * dpiScale ||
+                plotBounds.Height < MinimumPlotDimension * dpiScale)
             {
                 DrawCenteredMessage(graphics, "窗口空间不足", ClientRectangle);
                 return;
             }
 
-            DrawPlotArea(graphics, plotBounds);
+            DrawPlotArea(
+                graphics,
+                plotBounds,
+                dpiScale,
+                outerMargin,
+                axisLabelWidth);
 
             HistoryPoint[] currentPoints = points;
             if (currentPoints.Length == 0)
@@ -119,11 +135,64 @@ namespace TinyHwBar
                 return;
             }
 
-            DrawSeries(graphics, plotBounds, currentPoints, SelectCpuPercent, cpuPen);
-            DrawSeries(graphics, plotBounds, currentPoints, SelectMemoryPercent, memoryPen);
-            DrawSeries(graphics, plotBounds, currentPoints, SelectDiscreteGpuPercent, nvidiaPen);
-            DrawSeries(graphics, plotBounds, currentPoints, SelectIntegratedGpuPercent, intelPen);
-            DrawTimeRange(graphics, plotBounds, currentPoints);
+            DateTime startUtc;
+            DateTime endUtc;
+            int pointCount;
+            if (!TryGetTimeRange(currentPoints, out startUtc, out endUtc, out pointCount))
+            {
+                DrawCenteredMessage(graphics, "暂无可绘制指标", Rectangle.Round(plotBounds));
+                return;
+            }
+
+            TimeSpan maximumConnectedGap = CalculateConnectionGapThreshold(currentPoints);
+            DrawSeries(
+                graphics,
+                plotBounds,
+                currentPoints,
+                startUtc,
+                endUtc,
+                maximumConnectedGap,
+                SelectCpuPercent,
+                cpuPen,
+                dpiScale);
+            DrawSeries(
+                graphics,
+                plotBounds,
+                currentPoints,
+                startUtc,
+                endUtc,
+                maximumConnectedGap,
+                SelectMemoryPercent,
+                memoryPen,
+                dpiScale);
+            DrawSeries(
+                graphics,
+                plotBounds,
+                currentPoints,
+                startUtc,
+                endUtc,
+                maximumConnectedGap,
+                SelectDiscreteGpuPercent,
+                nvidiaPen,
+                dpiScale);
+            DrawSeries(
+                graphics,
+                plotBounds,
+                currentPoints,
+                startUtc,
+                endUtc,
+                maximumConnectedGap,
+                SelectIntegratedGpuPercent,
+                intelPen,
+                dpiScale);
+            DrawTimeRange(
+                graphics,
+                plotBounds,
+                startUtc,
+                endUtc,
+                pointCount,
+                bottomLabelHeight,
+                dpiScale);
 
             if (!HasPlottableData(currentPoints))
             {
@@ -162,15 +231,38 @@ namespace TinyHwBar
             return pen;
         }
 
-        private float DrawLegend(Graphics graphics)
+        private float DrawLegend(
+            Graphics graphics,
+            float dpiScale,
+            float outerMargin)
         {
-            float x = OuterMargin;
-            float y = OuterMargin;
-            float rowHeight = Math.Max(18.0f, legendFont.GetHeight(graphics) + 4.0f);
-            float rightEdge = Math.Max(OuterMargin, ClientSize.Width - OuterMargin);
+            float x = outerMargin;
+            float y = outerMargin;
+            float rowHeight = Math.Max(
+                18.0f * dpiScale,
+                legendFont.GetHeight(graphics) + (4.0f * dpiScale));
+            float rightEdge = Math.Max(outerMargin, ClientSize.Width - outerMargin);
 
-            DrawLegendItem(graphics, "CPU", cpuPen, ref x, ref y, rowHeight, rightEdge);
-            DrawLegendItem(graphics, "RAM", memoryPen, ref x, ref y, rowHeight, rightEdge);
+            DrawLegendItem(
+                graphics,
+                "CPU",
+                cpuPen,
+                ref x,
+                ref y,
+                rowHeight,
+                rightEdge,
+                outerMargin,
+                dpiScale);
+            DrawLegendItem(
+                graphics,
+                "RAM",
+                memoryPen,
+                ref x,
+                ref y,
+                rowHeight,
+                rightEdge,
+                outerMargin,
+                dpiScale);
             DrawLegendItem(
                 graphics,
                 DiscreteGpuLegendLabel,
@@ -178,7 +270,9 @@ namespace TinyHwBar
                 ref x,
                 ref y,
                 rowHeight,
-                rightEdge);
+                rightEdge,
+                outerMargin,
+                dpiScale);
             DrawLegendItem(
                 graphics,
                 IntegratedGpuLegendLabel,
@@ -186,9 +280,11 @@ namespace TinyHwBar
                 ref x,
                 ref y,
                 rowHeight,
-                rightEdge);
+                rightEdge,
+                outerMargin,
+                dpiScale);
 
-            return y + rowHeight + 4.0f;
+            return y + rowHeight + (4.0f * dpiScale);
         }
 
         private void DrawLegendItem(
@@ -198,29 +294,38 @@ namespace TinyHwBar
             ref float x,
             ref float y,
             float rowHeight,
-            float rightEdge)
+            float rightEdge,
+            float outerMargin,
+            float dpiScale)
         {
             SizeF labelSize = graphics.MeasureString(label, legendFont);
-            float itemWidth = 24.0f + labelSize.Width + 16.0f;
+            float itemWidth = (24.0f * dpiScale) +
+                labelSize.Width +
+                (16.0f * dpiScale);
 
-            if (x > OuterMargin && x + itemWidth > rightEdge)
+            if (x > outerMargin && x + itemWidth > rightEdge)
             {
-                x = OuterMargin;
+                x = outerMargin;
                 y += rowHeight;
             }
 
             float centerY = y + (rowHeight / 2.0f);
-            graphics.DrawLine(pen, x, centerY, x + 16.0f, centerY);
+            graphics.DrawLine(pen, x, centerY, x + (16.0f * dpiScale), centerY);
             graphics.DrawString(
                 label,
                 legendFont,
                 primaryTextBrush,
-                x + 22.0f,
+                x + (22.0f * dpiScale),
                 y + ((rowHeight - labelSize.Height) / 2.0f));
             x += itemWidth;
         }
 
-        private void DrawPlotArea(Graphics graphics, RectangleF plotBounds)
+        private void DrawPlotArea(
+            Graphics graphics,
+            RectangleF plotBounds,
+            float dpiScale,
+            float outerMargin,
+            float axisLabelWidth)
         {
             graphics.FillRectangle(plotBackgroundBrush, plotBounds);
 
@@ -238,10 +343,10 @@ namespace TinyHwBar
                         captionFont,
                         secondaryTextBrush,
                         new RectangleF(
-                            OuterMargin,
-                            y - 9.0f,
-                            AxisLabelWidth - 5.0f,
-                            18.0f),
+                            outerMargin,
+                            y - (9.0f * dpiScale),
+                            axisLabelWidth - (5.0f * dpiScale),
+                            18.0f * dpiScale),
                         percentageFormat);
                 }
             }
@@ -264,13 +369,15 @@ namespace TinyHwBar
             Graphics graphics,
             RectangleF plotBounds,
             HistoryPoint[] historyPoints,
+            DateTime startUtc,
+            DateTime endUtc,
+            TimeSpan maximumConnectedGap,
             Func<HistoryPoint, int?> selector,
-            Pen pen)
+            Pen pen,
+            float dpiScale)
         {
-            float xStep = historyPoints.Length > 1
-                ? plotBounds.Width / (historyPoints.Length - 1)
-                : 0.0f;
             PointF previousPoint = PointF.Empty;
+            HistoryPoint previousHistoryPoint = null;
             int segmentLength = 0;
 
             for (int index = 0; index < historyPoints.Length; index++)
@@ -279,54 +386,89 @@ namespace TinyHwBar
                 int? value = historyPoint == null ? null : selector(historyPoint);
                 if (!value.HasValue)
                 {
-                    DrawIsolatedPoint(graphics, pen, previousPoint, segmentLength);
+                    DrawIsolatedPoint(
+                        graphics,
+                        pen,
+                        previousPoint,
+                        segmentLength,
+                        dpiScale);
                     segmentLength = 0;
+                    previousHistoryPoint = null;
                     continue;
                 }
 
                 int clampedValue = Math.Max(0, Math.Min(100, value.Value));
                 PointF currentPoint = new PointF(
-                    plotBounds.Left + (xStep * index),
+                    MapTimestampToX(
+                        historyPoint.TimestampUtc,
+                        startUtc,
+                        endUtc,
+                        plotBounds),
                     ValueToY(clampedValue, plotBounds));
 
-                if (segmentLength > 0)
+                if (segmentLength > 0 &&
+                    ArePointsConnected(
+                        previousHistoryPoint,
+                        historyPoint,
+                        maximumConnectedGap))
                 {
                     graphics.DrawLine(pen, previousPoint, currentPoint);
                 }
+                else if (segmentLength > 0)
+                {
+                    DrawIsolatedPoint(
+                        graphics,
+                        pen,
+                        previousPoint,
+                        segmentLength,
+                        dpiScale);
+                    segmentLength = 0;
+                }
 
                 previousPoint = currentPoint;
+                previousHistoryPoint = historyPoint;
                 segmentLength++;
             }
 
-            DrawIsolatedPoint(graphics, pen, previousPoint, segmentLength);
+            DrawIsolatedPoint(
+                graphics,
+                pen,
+                previousPoint,
+                segmentLength,
+                dpiScale);
         }
 
         private static void DrawIsolatedPoint(
             Graphics graphics,
             Pen pen,
             PointF point,
-            int segmentLength)
+            int segmentLength,
+            float dpiScale)
         {
             if (segmentLength == 1)
             {
-                graphics.DrawEllipse(pen, point.X - 1.5f, point.Y - 1.5f, 3.0f, 3.0f);
+                float radius = 1.5f * dpiScale;
+                float diameter = radius * 2.0f;
+                graphics.DrawEllipse(
+                    pen,
+                    point.X - radius,
+                    point.Y - radius,
+                    diameter,
+                    diameter);
             }
         }
 
         private void DrawTimeRange(
             Graphics graphics,
             RectangleF plotBounds,
-            HistoryPoint[] historyPoints)
+            DateTime startUtc,
+            DateTime endUtc,
+            int pointCount,
+            float bottomLabelHeight,
+            float dpiScale)
         {
-            HistoryPoint first = FindFirstPoint(historyPoints);
-            HistoryPoint last = FindLastPoint(historyPoints);
-            if (first == null || last == null)
-            {
-                return;
-            }
-
-            DateTime localStart = first.TimestampUtc.ToLocalTime();
-            DateTime localEnd = last.TimestampUtc.ToLocalTime();
+            DateTime localStart = startUtc.ToLocalTime();
+            DateTime localEnd = endUtc.ToLocalTime();
             bool sameDay = localStart.Date == localEnd.Date;
             string startText = localStart.ToString(
                 sameDay ? "HH:mm:ss" : "MM-dd HH:mm",
@@ -335,12 +477,12 @@ namespace TinyHwBar
                 sameDay ? "HH:mm:ss" : "MM-dd HH:mm",
                 CultureInfo.CurrentCulture);
             string rangeText = FormatDuration(localEnd - localStart) + " · " +
-                historyPoints.Length.ToString(CultureInfo.CurrentCulture) + " 点";
+                pointCount.ToString(CultureInfo.CurrentCulture) + " 点";
             RectangleF labelBounds = new RectangleF(
                 plotBounds.Left,
-                plotBounds.Bottom + 4.0f,
+                plotBounds.Bottom + (4.0f * dpiScale),
                 plotBounds.Width,
-                BottomLabelHeight - 4.0f);
+                bottomLabelHeight - (4.0f * dpiScale));
 
             using (StringFormat leftFormat = new StringFormat())
             using (StringFormat centerFormat = new StringFormat())
@@ -408,30 +550,149 @@ namespace TinyHwBar
             return false;
         }
 
-        private static HistoryPoint FindFirstPoint(HistoryPoint[] historyPoints)
+        private static int CompareHistoryPoints(HistoryPoint left, HistoryPoint right)
         {
-            for (int index = 0; index < historyPoints.Length; index++)
+            if (ReferenceEquals(left, right))
             {
-                if (historyPoints[index] != null)
-                {
-                    return historyPoints[index];
-                }
+                return 0;
             }
 
-            return null;
+            if (left == null)
+            {
+                return 1;
+            }
+
+            if (right == null)
+            {
+                return -1;
+            }
+
+            return left.TimestampUtc.CompareTo(right.TimestampUtc);
         }
 
-        private static HistoryPoint FindLastPoint(HistoryPoint[] historyPoints)
+        private static bool TryGetTimeRange(
+            HistoryPoint[] historyPoints,
+            out DateTime startUtc,
+            out DateTime endUtc,
+            out int pointCount)
         {
-            for (int index = historyPoints.Length - 1; index >= 0; index--)
+            startUtc = DateTime.MaxValue;
+            endUtc = DateTime.MinValue;
+            pointCount = 0;
+
+            foreach (HistoryPoint point in historyPoints)
             {
-                if (historyPoints[index] != null)
+                if (point == null)
                 {
-                    return historyPoints[index];
+                    continue;
                 }
+
+                if (point.TimestampUtc < startUtc)
+                {
+                    startUtc = point.TimestampUtc;
+                }
+
+                if (point.TimestampUtc > endUtc)
+                {
+                    endUtc = point.TimestampUtc;
+                }
+
+                pointCount++;
             }
 
-            return null;
+            return pointCount > 0;
+        }
+
+        internal static float MapTimestampToX(
+            DateTime timestampUtc,
+            DateTime startUtc,
+            DateTime endUtc,
+            RectangleF plotBounds)
+        {
+            long rangeTicks = endUtc.Ticks - startUtc.Ticks;
+            if (rangeTicks <= 0)
+            {
+                return plotBounds.Left + (plotBounds.Width / 2.0f);
+            }
+
+            double fraction = (double)(timestampUtc.Ticks - startUtc.Ticks) / rangeTicks;
+            fraction = Math.Max(0.0, Math.Min(1.0, fraction));
+            return plotBounds.Left + (float)(plotBounds.Width * fraction);
+        }
+
+        internal static TimeSpan CalculateConnectionGapThreshold(
+            HistoryPoint[] historyPoints)
+        {
+            List<long> positiveGapTicks = new List<long>();
+            HistoryPoint previous = null;
+            foreach (HistoryPoint point in historyPoints)
+            {
+                if (point == null)
+                {
+                    continue;
+                }
+
+                if (previous != null)
+                {
+                    long gapTicks = point.TimestampUtc.Ticks - previous.TimestampUtc.Ticks;
+                    if (gapTicks > 0)
+                    {
+                        positiveGapTicks.Add(gapTicks);
+                    }
+                }
+
+                previous = point;
+            }
+
+            long minimumTicks = TimeSpan.FromSeconds(MinimumConnectionGapSeconds).Ticks;
+            long maximumTicks = TimeSpan.FromSeconds(MaximumConnectionGapSeconds).Ticks;
+            if (positiveGapTicks.Count == 0)
+            {
+                return TimeSpan.FromTicks(minimumTicks);
+            }
+
+            positiveGapTicks.Sort();
+            long medianTicks = positiveGapTicks[positiveGapTicks.Count / 2];
+            long scaledTicks = medianTicks > long.MaxValue / 4L
+                ? long.MaxValue
+                : medianTicks * 4L;
+            long thresholdTicks = Math.Max(minimumTicks, Math.Min(maximumTicks, scaledTicks));
+            return TimeSpan.FromTicks(thresholdTicks);
+        }
+
+        internal static bool ArePointsConnected(
+            HistoryPoint previous,
+            HistoryPoint current,
+            TimeSpan maximumConnectedGap)
+        {
+            if (previous == null || current == null)
+            {
+                return false;
+            }
+
+            TimeSpan gap = current.TimestampUtc - previous.TimestampUtc;
+            return gap > TimeSpan.Zero && gap <= maximumConnectedGap;
+        }
+
+        private void UpdatePenWidths(float dpiScale)
+        {
+            borderPen.Width = 1.0f * dpiScale;
+            gridPen.Width = 1.0f * dpiScale;
+            cpuPen.Width = 1.8f * dpiScale;
+            memoryPen.Width = 1.8f * dpiScale;
+            nvidiaPen.Width = 1.8f * dpiScale;
+            intelPen.Width = 1.8f * dpiScale;
+        }
+
+        private static float GetDpiScale(Graphics graphics)
+        {
+            float dpiX = graphics == null ? 96.0f : graphics.DpiX;
+            if (float.IsNaN(dpiX) || float.IsInfinity(dpiX) || dpiX <= 0.0f)
+            {
+                dpiX = 96.0f;
+            }
+
+            return Math.Max(1.0f, dpiX / 96.0f);
         }
 
         private static string FormatDuration(TimeSpan duration)

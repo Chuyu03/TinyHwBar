@@ -12,6 +12,88 @@ using System.Windows.Forms;
 
 namespace TinyHwBar
 {
+    internal sealed class HistoryPersistenceWarningGate
+    {
+        private int generation = 1;
+        private int scheduledGeneration;
+        private int shownGeneration;
+
+        internal int CaptureGeneration()
+        {
+            return Interlocked.CompareExchange(ref generation, 0, 0);
+        }
+
+        internal bool TrySchedule(int candidateGeneration)
+        {
+            if (!IsCurrent(candidateGeneration) ||
+                Interlocked.CompareExchange(
+                    ref scheduledGeneration,
+                    candidateGeneration,
+                    0) != 0)
+            {
+                return false;
+            }
+
+            if (IsCurrent(candidateGeneration))
+            {
+                return true;
+            }
+
+            ReleaseSchedule(candidateGeneration);
+            return false;
+        }
+
+        internal bool TryShow(int candidateGeneration)
+        {
+            if (!IsCurrent(candidateGeneration))
+            {
+                ReleaseSchedule(candidateGeneration);
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref shownGeneration,
+                    candidateGeneration,
+                    0) != 0)
+            {
+                return false;
+            }
+
+            if (IsCurrent(candidateGeneration))
+            {
+                return true;
+            }
+
+            Interlocked.CompareExchange(
+                ref shownGeneration,
+                0,
+                candidateGeneration);
+            ReleaseSchedule(candidateGeneration);
+            return false;
+        }
+
+        internal void ReleaseSchedule(int candidateGeneration)
+        {
+            Interlocked.CompareExchange(
+                ref scheduledGeneration,
+                0,
+                candidateGeneration);
+        }
+
+        internal void Reset()
+        {
+            Interlocked.Increment(ref generation);
+            Interlocked.Exchange(ref shownGeneration, 0);
+            Interlocked.Exchange(ref scheduledGeneration, 0);
+        }
+
+        private bool IsCurrent(int candidateGeneration)
+        {
+            return candidateGeneration != 0 &&
+                CaptureGeneration() == candidateGeneration;
+        }
+    }
+
     internal sealed class MonitorForm : Form
     {
         private const int BarWidth = 330;
@@ -30,6 +112,7 @@ namespace TinyHwBar
             DateTimeKind.Utc);
 
         private readonly AppSettings loadedSettings;
+        private readonly SettingsLoadResult settingsLoadResult;
         private readonly HardwareSampler sampler;
         private readonly Font primaryFont;
         private readonly Font compactFont;
@@ -41,8 +124,12 @@ namespace TinyHwBar
         private readonly Icon applicationIcon;
         private readonly NotifyIcon notifyIcon;
         private readonly MetricHistory history;
+        private readonly MetricHistory persistentHistory;
         private readonly HistoryStore historyStore;
+        private readonly HistoryLoadResult historyLoadResult;
         private readonly object historyPersistenceSynchronization = new object();
+        private readonly HistoryPersistenceWarningGate historyPersistenceWarningGate =
+            new HistoryPersistenceWarningGate();
         private readonly StartupManager startupManager;
         private readonly LoopbackApiOptions loopbackApiOptions;
         private readonly LoopbackApiServer loopbackApiServer;
@@ -58,10 +145,9 @@ namespace TinyHwBar
         private int updateCheckBusy;
         private int updatePackageBusy;
         private int telemetrySendBusy;
-        private int historyPersistenceWarningScheduled;
-        private int historyPersistenceWarningShown;
-        private DateTime historyPersistenceStartUtc;
         private bool settingsPersistenceWarningShown;
+        private bool settingsAutomaticSaveAllowed;
+        private bool historyAutomaticSaveAllowed;
         private bool locked;
         private bool clickThrough;
         private int opacityPercent;
@@ -69,11 +155,14 @@ namespace TinyHwBar
         private Point dragStartCursor;
         private Point dragStartLocation;
         private LoopbackApiSession loopbackApiSession;
+        private bool loopbackApiStartupFailed;
         private string statusText = "CPU -- · RAM -- · GPU -- · VR -- · --°";
 
         internal MonitorForm()
         {
-            loadedSettings = SettingsStore.Load();
+            settingsLoadResult = SettingsStore.LoadWithStatus();
+            loadedSettings = settingsLoadResult.CreateSessionSettings();
+            settingsAutomaticSaveAllowed = settingsLoadResult.AllowsAutomaticSave;
             locked = loadedSettings.Locked;
             clickThrough = loadedSettings.ClickThrough;
             opacityPercent = loadedSettings.OpacityPercent;
@@ -92,17 +181,13 @@ namespace TinyHwBar
             applicationIcon = LoadApplicationIcon();
             Icon = applicationIcon;
             history = new MetricHistory();
+            persistentHistory = new MetricHistory();
             historyStore = new HistoryStore();
-            historyPersistenceStartUtc = loadedSettings.PersistHistory
-                ? DateTime.MinValue
-                : DateTime.MaxValue;
-            if (loadedSettings.PersistHistory)
+            historyLoadResult = historyStore.LoadWithStatus();
+            historyAutomaticSaveAllowed = historyLoadResult.AllowsAutomaticSave;
+            foreach (HistoryPoint point in historyLoadResult.Points)
             {
-                HistoryPoint[] persistedPoints = historyStore.Load();
-                foreach (HistoryPoint point in persistedPoints)
-                {
-                    history.Add(point);
-                }
+                AddHistoryPoint(history, persistentHistory, point, true);
             }
 
             startupManager = new StartupManager(Application.ExecutablePath);
@@ -175,6 +260,10 @@ namespace TinyHwBar
 
             sampler = new HardwareSampler();
             sampler.SetGatewayLatencyEnabled(loadedSettings.GatewayLatencyEnabled);
+            sampler.SetGpuSelection(
+                loadedSettings.GpuSelectionMode,
+                loadedSettings.SelectedGpuAdapterId,
+                loadedSettings.SelectedGpuAdapterName);
             ApplyInitialPosition();
             SaveSettings();
         }
@@ -205,6 +294,7 @@ namespace TinyHwBar
         {
             base.OnShown(e);
 
+            ShowLoadProtectionWarnings();
             SaveHistoryIfEnabled();
             sampleTimer = new System.Threading.Timer(
                 SampleHardware,
@@ -391,14 +481,20 @@ namespace TinyHwBar
             loopbackApiSession = null;
             HistorySaveFailure finalHistoryFailure = SaveHistoryCore(true);
             if (finalHistoryFailure != null &&
+                finalHistoryFailure.Stage != HistorySaveFailureStage.ProtectExistingFile &&
                 e.CloseReason == CloseReason.UserClosing)
             {
                 ShowHistoryPersistenceWarning(
                     finalHistoryFailure.ToSafeDisplayText(),
-                    true);
+                    true,
+                    historyPersistenceWarningGate.CaptureGeneration());
             }
 
-            history.Clear();
+            lock (historyPersistenceSynchronization)
+            {
+                history.Clear();
+                persistentHistory.Clear();
+            }
 
             if (dashboard != null && !dashboard.IsDisposed)
             {
@@ -442,11 +538,16 @@ namespace TinyHwBar
                         return;
                     }
 
-                    history.Add(
+                    HistoryPoint point = HistoryPoint.FromSnapshot(
                         snapshot,
                         snapshot.NetworkReceiveBytesPerSecond,
                         snapshot.NetworkSendBytesPerSecond,
                         snapshot.IntegratedGpuPercent);
+                    AddHistoryPoint(
+                        history,
+                        persistentHistory,
+                        point,
+                        loadedSettings.PersistHistory);
                 }
                 string newStatusText = snapshot.ToDisplayText();
 
@@ -707,6 +808,7 @@ namespace TinyHwBar
             }
             else
             {
+                dashboard.SyncSettings(loadedSettings.Clone());
                 if (dashboard.WindowState == FormWindowState.Minimized)
                 {
                     dashboard.WindowState = FormWindowState.Normal;
@@ -716,7 +818,6 @@ namespace TinyHwBar
                 dashboard.Activate();
             }
 
-            dashboard.RefreshSettings(loadedSettings.Clone());
             RefreshAdvancedStatus();
             HardwareSnapshot snapshot = ReadLatestSnapshot();
             if (snapshot != null)
@@ -761,11 +862,6 @@ namespace TinyHwBar
                     e.TelemetryEnabled,
                     out normalizedTelemetryEndpoint))
             {
-                if (dashboard != null && !dashboard.IsDisposed)
-                {
-                    dashboard.RefreshSettings(loadedSettings.Clone());
-                }
-
                 return;
             }
 
@@ -776,15 +872,22 @@ namespace TinyHwBar
             lock (historyPersistenceSynchronization)
             {
                 loadedSettings.PersistHistory = e.PersistHistory;
-                if (historyPersistenceChanged)
-                {
-                    historyPersistenceStartUtc = e.PersistHistory
-                        ? DateTime.UtcNow
-                        : DateTime.MaxValue;
-                }
             }
             loadedSettings.GatewayLatencyEnabled = e.GatewayLatencyEnabled;
             sampler.SetGatewayLatencyEnabled(e.GatewayLatencyEnabled);
+            loadedSettings.GpuSelectionMode = e.GpuSelectionMode;
+            loadedSettings.SelectedGpuAdapterId =
+                e.GpuSelectionMode == GpuSelectionMode.Manual
+                    ? e.SelectedGpuAdapterId
+                    : string.Empty;
+            loadedSettings.SelectedGpuAdapterName =
+                e.GpuSelectionMode == GpuSelectionMode.Manual
+                    ? e.SelectedGpuAdapterName
+                    : string.Empty;
+            sampler.SetGpuSelection(
+                loadedSettings.GpuSelectionMode,
+                loadedSettings.SelectedGpuAdapterId,
+                loadedSettings.SelectedGpuAdapterName);
             Opacity = opacityPercent / 100.0;
             ApplyClickThroughStyle();
 
@@ -793,10 +896,6 @@ namespace TinyHwBar
                 if (loadedSettings.PersistHistory)
                 {
                     SaveHistoryIfEnabled();
-                }
-                else
-                {
-                    ClearPersistedHistoryWithWarning();
                 }
             }
 
@@ -850,6 +949,10 @@ namespace TinyHwBar
             loadedSettings.TelemetryEndpoint = normalizedTelemetryEndpoint;
 
             SaveSettings(true);
+            if (dashboard != null && !dashboard.IsDisposed)
+            {
+                dashboard.RefreshSettings(loadedSettings.Clone());
+            }
             RefreshAdvancedStatus();
         }
 
@@ -858,6 +961,7 @@ namespace TinyHwBar
             lock (historyPersistenceSynchronization)
             {
                 history.Clear();
+                persistentHistory.Clear();
             }
 
             ClearPersistedHistoryWithWarning();
@@ -869,13 +973,22 @@ namespace TinyHwBar
             lock (historyPersistenceSynchronization)
             {
                 cleared = historyStore.Clear();
+                if (cleared)
+                {
+                    historyAutomaticSaveAllowed = true;
+                    historyPersistenceWarningGate.Reset();
+                }
+                else
+                {
+                    historyAutomaticSaveAllowed = false;
+                }
             }
 
             if (!cleared)
             {
                 MessageBox.Show(
                     this,
-                    "内存历史已清除，但本地历史文件无法删除。请退出 TinyHwBar 后手动删除 %LOCALAPPDATA%\\TinyHwBar\\history.csv。",
+                    "内存历史已清除，但本地历史文件无法删除。请退出 TinyHwBar 后同时核对并删除 %LOCALAPPDATA%\\TinyHwBar\\history.csv 及 history.csv.bak；只删除主文件时，有效备份会在下次启动继续用于恢复。",
                     "TinyHwBar",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
@@ -923,21 +1036,19 @@ namespace TinyHwBar
 
         private void ApplyPersistedAdvancedFeatures()
         {
-            bool settingsChanged = false;
-
             if (loadedSettings.LoopbackApiEnabled)
             {
                 loopbackApiOptions.Enabled = true;
                 try
                 {
                     loopbackApiSession = loopbackApiServer.Start();
+                    loopbackApiStartupFailed = false;
                 }
                 catch (Exception)
                 {
                     loopbackApiOptions.Enabled = false;
-                    loadedSettings.LoopbackApiEnabled = false;
                     loopbackApiSession = null;
-                    settingsChanged = true;
+                    loopbackApiStartupFailed = true;
                 }
             }
 
@@ -951,10 +1062,6 @@ namespace TinyHwBar
             }
 
             RefreshAdvancedStatus();
-            if (settingsChanged)
-            {
-                SaveSettings();
-            }
         }
 
         private bool ApplyStartupPreference(bool requestedEnabled)
@@ -1056,6 +1163,7 @@ namespace TinyHwBar
                 loopbackApiOptions.Enabled = false;
                 loopbackApiServer.Stop();
                 loopbackApiSession = null;
+                loopbackApiStartupFailed = false;
                 return false;
             }
 
@@ -1080,12 +1188,14 @@ namespace TinyHwBar
             try
             {
                 loopbackApiSession = loopbackApiServer.Start();
+                loopbackApiStartupFailed = false;
                 return true;
             }
             catch (Exception exception)
             {
                 loopbackApiOptions.Enabled = false;
                 loopbackApiSession = null;
+                loopbackApiStartupFailed = true;
                 ShowAdvancedOperationError("启动本机 API 失败", exception);
                 return false;
             }
@@ -1288,6 +1398,12 @@ namespace TinyHwBar
                 "发现版本 " + manifest.Version + "。\r\n\r\n" +
                 "若继续，将从下面的 HTTPS 地址下载最多 32 MiB：\r\n" +
                 manifest.DownloadUri.AbsoluteUri +
+                "\r\n\r\n版本说明：\r\n" +
+                (string.IsNullOrWhiteSpace(manifest.ReleaseNotes)
+                    ? "（发布方未提供）"
+                    : manifest.ReleaseNotes) +
+                "\r\n\r\n预期 SHA-256：\r\n" +
+                manifest.Sha256 +
                 "\r\n\r\n下载后会校验清单中的 SHA-256，并只暂存为：\r\n" +
                 Path.Combine(stagingDirectory, UpdatePackageService.StagedFileName) +
                 "\r\n\r\n它不会自动运行、替换当前 EXE 或安装。是否下载并暂存？",
@@ -1598,7 +1714,7 @@ namespace TinyHwBar
         private static string GetApplicationVersionToken()
         {
             Version version = Assembly.GetExecutingAssembly().GetName().Version;
-            return version == null ? "2.0.0.0" : version.ToString();
+            return version == null ? "3.0.0.0" : version.ToString();
         }
 
         private void SetUpdateStatus(string text)
@@ -1678,6 +1794,11 @@ namespace TinyHwBar
                     loopbackApiSession.Port.ToString(CultureInfo.InvariantCulture) +
                     "/v1/status\r\nAuthorization: Bearer " +
                     loopbackApiSession.BearerToken);
+            }
+            else if (loadedSettings.LoopbackApiEnabled && loopbackApiStartupFailed)
+            {
+                dashboard.SetApiStatus(
+                    "本次启动失败；没有监听任何端口。启用偏好已保留，下次启动会重试。");
             }
             else
             {
@@ -1964,6 +2085,37 @@ namespace TinyHwBar
             return (Icon)SystemIcons.Application.Clone();
         }
 
+        private void ShowLoadProtectionWarnings()
+        {
+            List<string> details = new List<string>();
+            if (settingsLoadResult.NeedsUserAttention)
+            {
+                settingsPersistenceWarningShown = true;
+                details.Add("设置：" + settingsLoadResult.ToSafeDisplayText());
+                details.Add(
+                    "安全措施：本次会话未自动启用历史保存、网关 ICMP、启动更新检查、本地 API 或遥测；如确实需要，可在控制中心重新勾选并应用，但只对本次会话生效，不会写回受保护的 settings.ini。");
+            }
+
+            if (historyLoadResult.NeedsUserAttention)
+            {
+                details.Add("历史：" + historyLoadResult.ToSafeDisplayText());
+            }
+
+            if (details.Count == 0)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                "TinyHwBar 检测到本地数据文件异常。为避免静默覆盖，原文件已保留，本次运行不会自动写回受影响的文件。\r\n\r\n" +
+                string.Join("\r\n", details.ToArray()) +
+                "\r\n\r\n程序仍可继续监控。请先备份并检查 %LOCALAPPDATA%\\TinyHwBar。若确认信任有效的 settings.ini.bak，请退出程序后将其复制为 settings.ini；若要恢复默认设置，则退出后同时移走主设置与备份再启动。历史文件只有在你明确确认“清除历史”后才会删除。",
+                "TinyHwBar 已保护本地数据",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
         private void SaveSettings()
         {
             SaveSettings(false);
@@ -1977,11 +2129,14 @@ namespace TinyHwBar
             loadedSettings.Locked = locked;
             loadedSettings.ClickThrough = clickThrough;
             loadedSettings.OpacityPercent = opacityPercent;
-            bool saved = SettingsStore.Save(loadedSettings.Clone());
+            bool saved = settingsAutomaticSaveAllowed &&
+                SettingsStore.SaveAfterLoad(
+                    loadedSettings.Clone(),
+                    settingsLoadResult);
 
             if (dashboard != null && !dashboard.IsDisposed)
             {
-                dashboard.RefreshSettings(loadedSettings.Clone());
+                dashboard.SyncSettings(loadedSettings.Clone());
             }
 
             if (!saved && warnOnFailure && !settingsPersistenceWarningShown)
@@ -1998,11 +2153,20 @@ namespace TinyHwBar
 
         private void SaveHistoryIfEnabled()
         {
+            int warningGeneration =
+                historyPersistenceWarningGate.CaptureGeneration();
             HistorySaveFailure failure = SaveHistoryCore(false);
-            if (failure != null)
+            if (ShouldWarnForHistorySaveFailure(failure))
             {
-                WarnHistoryPersistenceFailure(failure);
+                WarnHistoryPersistenceFailure(failure, warningGeneration);
             }
+        }
+
+        internal static bool ShouldWarnForHistorySaveFailure(
+            HistorySaveFailure failure)
+        {
+            return failure != null &&
+                failure.Stage != HistorySaveFailureStage.ProtectExistingFile;
         }
 
         private HistorySaveFailure SaveHistoryCore(bool allowWhileStopping)
@@ -2021,20 +2185,15 @@ namespace TinyHwBar
                     return null;
                 }
 
-                HistoryPoint[] points = history.Snapshot();
-                if (historyPersistenceStartUtc != DateTime.MinValue)
+                if (!historyAutomaticSaveAllowed)
                 {
-                    List<HistoryPoint> filteredPoints = new List<HistoryPoint>(points.Length);
-                    foreach (HistoryPoint point in points)
-                    {
-                        if (point != null && point.TimestampUtc >= historyPersistenceStartUtc)
-                        {
-                            filteredPoints.Add(point);
-                        }
-                    }
-
-                    points = filteredPoints.ToArray();
+                    return new HistorySaveFailure(
+                        HistorySaveFailureStage.ProtectExistingFile,
+                        "ProtectedLoadState",
+                        null);
                 }
+
+                HistoryPoint[] points = persistentHistory.Snapshot();
 
                 if (historyStore.Save(points, out failure))
                 {
@@ -2048,15 +2207,42 @@ namespace TinyHwBar
                 null);
         }
 
-        private void WarnHistoryPersistenceFailure(HistorySaveFailure failure)
+        internal static void AddHistoryPoint(
+            MetricHistory sessionHistory,
+            MetricHistory persistableHistory,
+            HistoryPoint point,
+            bool persistenceEnabled)
+        {
+            if (sessionHistory == null)
+            {
+                throw new ArgumentNullException("sessionHistory");
+            }
+
+            if (persistableHistory == null)
+            {
+                throw new ArgumentNullException("persistableHistory");
+            }
+
+            if (point == null)
+            {
+                throw new ArgumentNullException("point");
+            }
+
+            sessionHistory.Add(point);
+            if (persistenceEnabled)
+            {
+                persistableHistory.Add(point);
+            }
+        }
+
+        private void WarnHistoryPersistenceFailure(
+            HistorySaveFailure failure,
+            int warningGeneration)
         {
             if (Interlocked.CompareExchange(ref stopping, 0, 0) != 0 ||
                 !IsHandleCreated ||
                 IsDisposed ||
-                Interlocked.CompareExchange(
-                    ref historyPersistenceWarningScheduled,
-                    1,
-                    0) != 0)
+                !historyPersistenceWarningGate.TrySchedule(warningGeneration))
             {
                 return;
             }
@@ -2070,52 +2256,43 @@ namespace TinyHwBar
                 {
                     BeginInvoke((MethodInvoker)delegate
                     {
-                        ShowHistoryPersistenceWarning(failureText, false);
+                        ShowHistoryPersistenceWarning(
+                            failureText,
+                            false,
+                            warningGeneration);
                     });
                 }
                 catch (ObjectDisposedException)
                 {
                     // The form is closing.
-                    ResetHistoryWarningScheduleIfActive();
+                    historyPersistenceWarningGate.ReleaseSchedule(
+                        warningGeneration);
                 }
                 catch (InvalidOperationException)
                 {
                     // The form is closing.
-                    ResetHistoryWarningScheduleIfActive();
+                    historyPersistenceWarningGate.ReleaseSchedule(
+                        warningGeneration);
                 }
 
                 return;
             }
 
-            ShowHistoryPersistenceWarning(failureText, false);
-        }
-
-        private void ResetHistoryWarningScheduleIfActive()
-        {
-            if (Interlocked.CompareExchange(ref stopping, 0, 0) == 0 &&
-                !IsDisposed)
-            {
-                Interlocked.Exchange(
-                    ref historyPersistenceWarningScheduled,
-                    0);
-            }
+            ShowHistoryPersistenceWarning(
+                failureText,
+                false,
+                warningGeneration);
         }
 
         private void ShowHistoryPersistenceWarning(
             string failureText,
-            bool allowWhileStopping)
+            bool allowWhileStopping,
+            int warningGeneration)
         {
             if ((!allowWhileStopping &&
                  Interlocked.CompareExchange(ref stopping, 0, 0) != 0) ||
-                IsDisposed)
-            {
-                return;
-            }
-
-            if (Interlocked.CompareExchange(
-                    ref historyPersistenceWarningShown,
-                    1,
-                    0) != 0)
+                IsDisposed ||
+                !historyPersistenceWarningGate.TryShow(warningGeneration))
             {
                 return;
             }

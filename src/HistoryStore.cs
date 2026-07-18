@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security;
 using System.Text;
 
 namespace TinyHwBar
@@ -15,7 +16,99 @@ namespace TinyHwBar
         WriteTemporaryFile = 4,
         InspectPrimaryFile = 5,
         ReplacePrimaryFile = 6,
-        MovePrimaryFile = 7
+        MovePrimaryFile = 7,
+        ProtectExistingFile = 8
+    }
+
+    internal enum HistoryLoadStatus
+    {
+        Missing = 0,
+        Success = 1,
+        Unsupported = 2,
+        Corrupt = 3,
+        IoFailure = 4
+    }
+
+    internal sealed class HistoryLoadResult
+    {
+        internal HistoryLoadResult(
+            HistoryLoadStatus status,
+            HistoryPoint[] points,
+            bool loadedFromBackup,
+            HistoryLoadStatus? backupStatus)
+        {
+            Status = status;
+            Points = points ?? new HistoryPoint[0];
+            LoadedFromBackup = loadedFromBackup;
+            BackupStatus = backupStatus;
+        }
+
+        internal HistoryLoadStatus Status { get; private set; }
+
+        internal HistoryPoint[] Points { get; private set; }
+
+        internal bool LoadedFromBackup { get; private set; }
+
+        internal HistoryLoadStatus? BackupStatus { get; private set; }
+
+        internal bool AllowsAutomaticSave
+        {
+            get
+            {
+                if (Status == HistoryLoadStatus.Success)
+                {
+                    return true;
+                }
+
+                if (Status != HistoryLoadStatus.Missing || !BackupStatus.HasValue)
+                {
+                    return false;
+                }
+
+                return BackupStatus.Value == HistoryLoadStatus.Missing;
+            }
+        }
+
+        internal bool NeedsUserAttention
+        {
+            get { return !AllowsAutomaticSave; }
+        }
+
+        internal string ToSafeDisplayText()
+        {
+            string primaryText = FormatStatus(Status);
+            if (!BackupStatus.HasValue)
+            {
+                return "主历史文件：" + primaryText;
+            }
+
+            string backupText = FormatStatus(BackupStatus.Value);
+            string recoveryText = LoadedFromBackup
+                ? "；已从备份恢复到内存，原文件未被覆盖"
+                : "；未能从备份恢复";
+            return "主历史文件：" + primaryText +
+                "；备份文件：" + backupText +
+                recoveryText;
+        }
+
+        private static string FormatStatus(HistoryLoadStatus status)
+        {
+            switch (status)
+            {
+                case HistoryLoadStatus.Missing:
+                    return "不存在";
+                case HistoryLoadStatus.Success:
+                    return "可用";
+                case HistoryLoadStatus.Unsupported:
+                    return "版本不受支持";
+                case HistoryLoadStatus.Corrupt:
+                    return "内容损坏";
+                case HistoryLoadStatus.IoFailure:
+                    return "读取失败";
+                default:
+                    return "状态未知";
+            }
+        }
     }
 
     internal sealed class HistorySaveFailure
@@ -64,6 +157,9 @@ namespace TinyHwBar
                 case HistorySaveFailureStage.MovePrimaryFile:
                     stageText = "创建正式历史文件";
                     break;
+                case HistorySaveFailureStage.ProtectExistingFile:
+                    stageText = "保护异常或不兼容的历史文件";
+                    break;
                 default:
                     stageText = "保存本地历史";
                     break;
@@ -103,9 +199,12 @@ namespace TinyHwBar
 
         private const long MaximumFileBytes = 2L * 1024L * 1024L;
         private const string Header = "TinyHwBarHistory=1";
+        private const string HeaderPrefix = "TinyHwBarHistory=";
 
         private readonly object synchronization = new object();
         private readonly string historyPath;
+        private bool saveBlockedByLoadFailure;
+        private HistoryLoadStatus loadStatusBlockingSave;
 
         internal HistoryStore()
             : this(Path.Combine(
@@ -127,27 +226,81 @@ namespace TinyHwBar
 
         internal HistoryPoint[] Load()
         {
+            return LoadWithStatus().Points;
+        }
+
+        internal HistoryLoadResult LoadWithStatus()
+        {
             lock (synchronization)
             {
-                return LoadCore();
+                HistoryLoadResult result = LoadCore();
+                saveBlockedByLoadFailure = !result.AllowsAutomaticSave;
+                if (saveBlockedByLoadFailure)
+                {
+                    loadStatusBlockingSave = result.Status != HistoryLoadStatus.Missing
+                        ? result.Status
+                        : result.BackupStatus.GetValueOrDefault(HistoryLoadStatus.IoFailure);
+                }
+
+                return result;
             }
         }
 
-        private HistoryPoint[] LoadCore()
+        private HistoryLoadResult LoadCore()
+        {
+            HistoryFileReadResult primary = ReadFile(historyPath);
+            if (primary.Status == HistoryLoadStatus.Success)
+            {
+                return new HistoryLoadResult(
+                    HistoryLoadStatus.Success,
+                    primary.Points,
+                    false,
+                    null);
+            }
+
+            HistoryFileReadResult backup = ReadFile(historyPath + ".bak");
+            bool loadedFromBackup = backup.Status == HistoryLoadStatus.Success;
+            return new HistoryLoadResult(
+                primary.Status,
+                loadedFromBackup ? backup.Points : new HistoryPoint[0],
+                loadedFromBackup,
+                backup.Status);
+        }
+
+        private static HistoryFileReadResult ReadFile(string path)
         {
             try
             {
-                FileInfo file = new FileInfo(historyPath);
-                if (!file.Exists || file.Length <= 0 || file.Length > MaximumFileBytes)
+                if (Directory.Exists(path))
                 {
-                    return new HistoryPoint[0];
+                    return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
                 }
 
-                string[] lines = File.ReadAllLines(historyPath, Encoding.UTF8);
-                if (lines.Length == 0 ||
-                    !string.Equals(lines[0], Header, StringComparison.Ordinal))
+                FileInfo file = new FileInfo(path);
+                if (!file.Exists)
                 {
-                    return new HistoryPoint[0];
+                    return HistoryFileReadResult.Create(HistoryLoadStatus.Missing);
+                }
+
+                if (file.Length <= 0 || file.Length > MaximumFileBytes)
+                {
+                    return HistoryFileReadResult.Create(HistoryLoadStatus.Corrupt);
+                }
+
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                if (lines.Length == 0)
+                {
+                    return HistoryFileReadResult.Create(HistoryLoadStatus.Corrupt);
+                }
+
+                if (!string.Equals(lines[0], Header, StringComparison.Ordinal))
+                {
+                    HistoryLoadStatus headerStatus = lines[0].StartsWith(
+                        HeaderPrefix,
+                        StringComparison.Ordinal)
+                        ? HistoryLoadStatus.Unsupported
+                        : HistoryLoadStatus.Corrupt;
+                    return HistoryFileReadResult.Create(headerStatus);
                 }
 
                 DateTime nowUtc = DateTime.UtcNow;
@@ -156,25 +309,50 @@ namespace TinyHwBar
                 List<HistoryPoint> points = new List<HistoryPoint>(MaximumPointCount);
                 int firstLine = Math.Max(1, lines.Length - MaximumPointCount);
 
-                for (int lineIndex = firstLine; lineIndex < lines.Length; lineIndex++)
+                for (int lineIndex = 1; lineIndex < lines.Length; lineIndex++)
                 {
                     HistoryPoint point;
-                    if (!TryParse(lines[lineIndex], out point) ||
-                        point.TimestampUtc < oldestAllowedUtc ||
+                    if (!TryParse(lines[lineIndex], out point))
+                    {
+                        return HistoryFileReadResult.Create(HistoryLoadStatus.Corrupt);
+                    }
+
+                    if (point.TimestampUtc < oldestAllowedUtc ||
                         point.TimestampUtc > newestAllowedUtc)
                     {
                         continue;
                     }
 
-                    points.Add(point);
+                    if (lineIndex >= firstLine)
+                    {
+                        points.Add(point);
+                    }
                 }
 
                 points.Sort(CompareByTimestamp);
-                return points.ToArray();
+                return new HistoryFileReadResult(
+                    HistoryLoadStatus.Success,
+                    points.ToArray());
             }
-            catch (Exception)
+            catch (UnauthorizedAccessException)
             {
-                return new HistoryPoint[0];
+                return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
+            }
+            catch (IOException)
+            {
+                return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
+            }
+            catch (SecurityException)
+            {
+                return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
+            }
+            catch (NotSupportedException)
+            {
+                return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
+            }
+            catch (ArgumentException)
+            {
+                return HistoryFileReadResult.Create(HistoryLoadStatus.IoFailure);
             }
         }
 
@@ -205,6 +383,15 @@ namespace TinyHwBar
         {
             failure = null;
             HistorySaveFailureStage stage = HistorySaveFailureStage.ResolvePath;
+            if (saveBlockedByLoadFailure)
+            {
+                failure = new HistorySaveFailure(
+                    HistorySaveFailureStage.ProtectExistingFile,
+                    "HistoryLoad" + loadStatusBlockingSave.ToString(),
+                    null);
+                return false;
+            }
+
             try
             {
                 string directory = Path.GetDirectoryName(historyPath);
@@ -257,7 +444,10 @@ namespace TinyHwBar
                 bool primaryDeleted = TryDeleteWithResult(historyPath);
                 bool backupDeleted = TryDeleteWithResult(historyPath + ".bak");
                 bool temporaryFilesDeleted = TryDeleteTemporaryFilesWithResult();
-                return primaryDeleted && backupDeleted && temporaryFilesDeleted;
+                bool cleared = primaryDeleted && backupDeleted && temporaryFilesDeleted;
+                saveBlockedByLoadFailure = !cleared;
+
+                return cleared;
             }
         }
 
@@ -449,10 +639,8 @@ namespace TinyHwBar
                 stage = HistorySaveFailureStage.InspectPrimaryFile;
                 if (File.Exists(historyPath))
                 {
-                    TryDelete(backupPath);
                     stage = HistorySaveFailureStage.ReplacePrimaryFile;
                     File.Replace(temporaryPath, historyPath, backupPath, true);
-                    TryDelete(backupPath);
                 }
                 else
                 {
@@ -485,12 +673,13 @@ namespace TinyHwBar
         {
             try
             {
-                if (File.Exists(path))
+                if (Directory.Exists(path))
                 {
-                    File.Delete(path);
+                    return false;
                 }
 
-                return !File.Exists(path);
+                File.Delete(path);
+                return true;
             }
             catch (Exception)
             {
@@ -544,6 +733,26 @@ namespace TinyHwBar
             catch (Exception)
             {
                 return false;
+            }
+        }
+
+        private sealed class HistoryFileReadResult
+        {
+            internal HistoryFileReadResult(
+                HistoryLoadStatus status,
+                HistoryPoint[] points)
+            {
+                Status = status;
+                Points = points ?? new HistoryPoint[0];
+            }
+
+            internal HistoryLoadStatus Status { get; private set; }
+
+            internal HistoryPoint[] Points { get; private set; }
+
+            internal static HistoryFileReadResult Create(HistoryLoadStatus status)
+            {
+                return new HistoryFileReadResult(status, new HistoryPoint[0]);
             }
         }
     }

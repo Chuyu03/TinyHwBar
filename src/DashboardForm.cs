@@ -1,10 +1,103 @@
 using System;
 using System.Drawing;
+using System.Drawing.Text;
 using System.Globalization;
 using System.Windows.Forms;
 
 namespace TinyHwBar
 {
+    internal sealed class GrayscaleTextCheckBox : CheckBox
+    {
+        private bool grayscaleTextRenderingEnabled;
+
+        internal GrayscaleTextCheckBox()
+        {
+            UseCompatibleTextRendering = false;
+        }
+
+        internal void EnableGrayscaleTextRendering()
+        {
+            if (grayscaleTextRenderingEnabled)
+            {
+                return;
+            }
+
+            Size originalPreferredSize = GetPreferredSize(Size.Empty);
+            MinimumSize = originalPreferredSize;
+            MaximumSize = originalPreferredSize;
+            UseCompatibleTextRendering = true;
+            grayscaleTextRenderingEnabled = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            TextRenderingHint previousHint = e.Graphics.TextRenderingHint;
+            try
+            {
+                e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                base.OnPaint(e);
+            }
+            finally
+            {
+                e.Graphics.TextRenderingHint = previousHint;
+            }
+        }
+    }
+
+    internal sealed class GrayscaleTextLabel : Label
+    {
+        private bool grayscaleTextRenderingEnabled;
+
+        internal GrayscaleTextLabel()
+        {
+            UseCompatibleTextRendering = false;
+        }
+
+        internal void EnableGrayscaleTextRendering()
+        {
+            if (grayscaleTextRenderingEnabled)
+            {
+                return;
+            }
+
+            int originalPreferredHeight = GetPreferredSize(Size.Empty).Height;
+            MinimumSize = new Size(MinimumSize.Width, originalPreferredHeight);
+            MaximumSize = new Size(MaximumSize.Width, originalPreferredHeight);
+            UseCompatibleTextRendering = true;
+            grayscaleTextRenderingEnabled = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            TextRenderingHint previousHint = e.Graphics.TextRenderingHint;
+            try
+            {
+                e.Graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                base.OnPaint(e);
+            }
+            finally
+            {
+                e.Graphics.TextRenderingHint = previousHint;
+            }
+        }
+    }
+
+    [Flags]
+    internal enum DashboardDirtyFields
+    {
+        None = 0,
+        Opacity = 1,
+        Locked = 2,
+        ClickThrough = 4,
+        History = 8,
+        Gateway = 16,
+        Gpu = 32,
+        Startup = 64,
+        Update = 128,
+        LoopbackApi = 256,
+        Telemetry = 512
+    }
+
     internal sealed class DashboardSettingsChangedEventArgs : EventArgs
     {
         internal DashboardSettingsChangedEventArgs(
@@ -13,6 +106,9 @@ namespace TinyHwBar
             int opacityPercent,
             bool persistHistory,
             bool gatewayLatencyEnabled,
+            GpuSelectionMode gpuSelectionMode,
+            string selectedGpuAdapterId,
+            string selectedGpuAdapterName,
             bool startupEnabled,
             bool automaticUpdateEnabled,
             string updateManifestUrl,
@@ -25,6 +121,9 @@ namespace TinyHwBar
             OpacityPercent = opacityPercent;
             PersistHistory = persistHistory;
             GatewayLatencyEnabled = gatewayLatencyEnabled;
+            GpuSelectionMode = gpuSelectionMode;
+            SelectedGpuAdapterId = selectedGpuAdapterId ?? string.Empty;
+            SelectedGpuAdapterName = selectedGpuAdapterName ?? string.Empty;
             StartupEnabled = startupEnabled;
             AutomaticUpdateEnabled = automaticUpdateEnabled;
             UpdateManifestUrl = updateManifestUrl ?? string.Empty;
@@ -42,6 +141,12 @@ namespace TinyHwBar
         internal bool PersistHistory { get; private set; }
 
         internal bool GatewayLatencyEnabled { get; private set; }
+
+        internal GpuSelectionMode GpuSelectionMode { get; private set; }
+
+        internal string SelectedGpuAdapterId { get; private set; }
+
+        internal string SelectedGpuAdapterName { get; private set; }
 
         internal bool StartupEnabled { get; private set; }
 
@@ -90,6 +195,11 @@ namespace TinyHwBar
         private readonly CheckBox clickThroughCheckBox;
         private readonly CheckBox persistHistoryCheckBox;
         private readonly CheckBox gatewayLatencyCheckBox;
+        private readonly RadioButton automaticGpuRadioButton;
+        private readonly RadioButton manualGpuRadioButton;
+        private readonly ComboBox gpuAdapterComboBox;
+        private readonly Button refreshGpuAdaptersButton;
+        private readonly Label gpuSelectionStatusLabel;
         private readonly CheckBox startupCheckBox;
         private readonly CheckBox automaticUpdateCheckBox;
         private readonly TextBox updateEndpointTextBox;
@@ -104,6 +214,9 @@ namespace TinyHwBar
         private readonly Font uiFont;
         private readonly Font metricFont;
         private bool resourcesDisposed;
+        private bool synchronizingSettings;
+        private DashboardDirtyFields dirtyFields;
+        private HardwareSnapshot latestSnapshot;
 
         internal DashboardForm(AppSettings settings, MetricHistory metricHistory)
         {
@@ -223,10 +336,12 @@ namespace TinyHwBar
 
             TableLayoutPanel settingsLayout = new TableLayoutPanel();
             settingsLayout.Dock = DockStyle.Fill;
+            settingsLayout.AutoScroll = true;
             settingsLayout.ColumnCount = 2;
-            settingsLayout.RowCount = 8;
+            settingsLayout.RowCount = 9;
             settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150.0f));
             settingsLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100.0f));
+            settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             settingsLayout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -283,6 +398,88 @@ namespace TinyHwBar
                 "只允许 RFC1918、CGNAT、IPv4/IPv6 链路本地和 IPv6 ULA 地址，" +
                 "公网或全局地址会被拒绝，不执行主动带宽测速。";
 
+            GroupBox gpuSelectionGroup = new GroupBox();
+            gpuSelectionGroup.Text = "GPU 显示选择";
+            gpuSelectionGroup.Dock = DockStyle.Top;
+            gpuSelectionGroup.AutoSize = true;
+            gpuSelectionGroup.Padding = new Padding(12, 8, 12, 10);
+            gpuSelectionGroup.Margin = new Padding(0, 8, 0, 8);
+
+            TableLayoutPanel gpuSelectionLayout = new TableLayoutPanel();
+            gpuSelectionLayout.Dock = DockStyle.Top;
+            gpuSelectionLayout.AutoSize = true;
+            gpuSelectionLayout.ColumnCount = 2;
+            gpuSelectionLayout.RowCount = 5;
+            gpuSelectionLayout.ColumnStyles.Add(
+                new ColumnStyle(SizeType.Percent, 100.0f));
+            gpuSelectionLayout.ColumnStyles.Add(
+                new ColumnStyle(SizeType.AutoSize));
+            for (int row = 0; row < 5; row++)
+            {
+                gpuSelectionLayout.RowStyles.Add(
+                    new RowStyle(SizeType.AutoSize));
+            }
+
+            automaticGpuRadioButton = new RadioButton();
+            automaticGpuRadioButton.Text = "自动选择（推荐）";
+            automaticGpuRadioButton.AutoSize = true;
+            automaticGpuRadioButton.TabIndex = 0;
+            automaticGpuRadioButton.AccessibleName = "GPU 自动选择（推荐）";
+            automaticGpuRadioButton.AccessibleDescription =
+                "自动选择可用的物理显卡；独显处于省电状态或数据不可用时回退核显。";
+            automaticGpuRadioButton.CheckedChanged += UpdateGpuSelectionControls;
+
+            Label automaticGpuDescription = new Label();
+            automaticGpuDescription.Text =
+                "默认自动选择，无需设置；设备变化后会重新选择，不按瞬时负载来回切换。";
+            automaticGpuDescription.AutoSize = true;
+            automaticGpuDescription.ForeColor = Color.FromArgb(71, 85, 105);
+            automaticGpuDescription.Margin = new Padding(22, 0, 0, 6);
+
+            manualGpuRadioButton = new RadioButton();
+            manualGpuRadioButton.Text = "手动指定监控条显示的 GPU";
+            manualGpuRadioButton.AutoSize = true;
+            manualGpuRadioButton.TabIndex = 1;
+            manualGpuRadioButton.AccessibleName = "GPU 手动选择";
+            manualGpuRadioButton.CheckedChanged += UpdateGpuSelectionControls;
+
+            gpuAdapterComboBox = new ComboBox();
+            gpuAdapterComboBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            gpuAdapterComboBox.Dock = DockStyle.Fill;
+            gpuAdapterComboBox.Margin = new Padding(22, 4, 8, 4);
+            gpuAdapterComboBox.TabIndex = 2;
+            gpuAdapterComboBox.AccessibleName = "手动选择 GPU 设备";
+            gpuAdapterComboBox.AccessibleDescription =
+                "列出本机检测到的物理独立显卡和核显。自动模式下禁用。";
+            gpuAdapterComboBox.SelectedIndexChanged += UpdateGpuSelectionStatus;
+
+            refreshGpuAdaptersButton = new Button();
+            refreshGpuAdaptersButton.Text = "刷新设备";
+            refreshGpuAdaptersButton.AutoSize = true;
+            refreshGpuAdaptersButton.Margin = new Padding(0, 3, 0, 3);
+            refreshGpuAdaptersButton.TabIndex = 3;
+            refreshGpuAdaptersButton.AccessibleName = "刷新 GPU 设备列表";
+            refreshGpuAdaptersButton.Click += RefreshGpuAdapters;
+
+            gpuSelectionStatusLabel = new Label();
+            gpuSelectionStatusLabel.AutoSize = true;
+            gpuSelectionStatusLabel.Dock = DockStyle.Fill;
+            gpuSelectionStatusLabel.ForeColor = Color.FromArgb(30, 64, 175);
+            gpuSelectionStatusLabel.Margin = new Padding(22, 4, 0, 0);
+            gpuSelectionStatusLabel.AccessibleName = "GPU 选择状态";
+
+            gpuSelectionLayout.Controls.Add(automaticGpuRadioButton, 0, 0);
+            gpuSelectionLayout.SetColumnSpan(automaticGpuRadioButton, 2);
+            gpuSelectionLayout.Controls.Add(automaticGpuDescription, 0, 1);
+            gpuSelectionLayout.SetColumnSpan(automaticGpuDescription, 2);
+            gpuSelectionLayout.Controls.Add(manualGpuRadioButton, 0, 2);
+            gpuSelectionLayout.SetColumnSpan(manualGpuRadioButton, 2);
+            gpuSelectionLayout.Controls.Add(gpuAdapterComboBox, 0, 3);
+            gpuSelectionLayout.Controls.Add(refreshGpuAdaptersButton, 1, 3);
+            gpuSelectionLayout.Controls.Add(gpuSelectionStatusLabel, 0, 4);
+            gpuSelectionLayout.SetColumnSpan(gpuSelectionStatusLabel, 2);
+            gpuSelectionGroup.Controls.Add(gpuSelectionLayout);
+
             Label privacyNote = new Label();
             privacyNote.AutoSize = false;
             privacyNote.Dock = DockStyle.Fill;
@@ -290,7 +487,8 @@ namespace TinyHwBar
             privacyNote.BackColor = Color.FromArgb(239, 246, 255);
             privacyNote.ForeColor = Color.FromArgb(30, 64, 175);
             privacyNote.Text =
-                "历史仅在本机保存最近 900 个数值点，超过 24 小时或格式异常的记录会被忽略，可随时清除。\r\n\r\n" +
+                "TinyHwBar 默认自动选择 GPU，无需手动设置；本地历史和本地网关检测都可在本页关闭。\r\n\r\n" +
+                "历史仅在本机保存最近 900 个数值点；超过 24 小时的记录会被忽略，格式异常的文件会保留且不会自动覆盖，可随时确认清除。\r\n\r\n" +
                 "网关延迟只测当前接口报告的本地网关：允许 RFC1918、CGNAT、IPv4/IPv6 链路本地和 IPv6 ULA；" +
                 "公网或全局地址会被拒绝，不执行主动带宽测速。";
 
@@ -321,9 +519,11 @@ namespace TinyHwBar
             settingsLayout.Controls.Add(clickThroughCheckBox, 1, 2);
             settingsLayout.Controls.Add(persistHistoryCheckBox, 1, 3);
             settingsLayout.Controls.Add(gatewayLatencyCheckBox, 1, 4);
-            settingsLayout.Controls.Add(privacyNote, 0, 5);
+            settingsLayout.Controls.Add(gpuSelectionGroup, 0, 5);
+            settingsLayout.SetColumnSpan(gpuSelectionGroup, 2);
+            settingsLayout.Controls.Add(privacyNote, 0, 6);
             settingsLayout.SetColumnSpan(privacyNote, 2);
-            settingsLayout.Controls.Add(settingsActions, 0, 7);
+            settingsLayout.Controls.Add(settingsActions, 0, 8);
             settingsLayout.SetColumnSpan(settingsActions, 2);
             settingsPage.Controls.Add(settingsLayout);
 
@@ -412,7 +612,9 @@ namespace TinyHwBar
             advancedLayout.Controls.Add(apiStatusLabel, 0, 8);
             advancedLayout.Controls.Add(apiStatusTextBox, 1, 8);
 
-            telemetryCheckBox = new CheckBox();
+            GrayscaleTextCheckBox grayscaleTelemetryCheckBox =
+                new GrayscaleTextCheckBox();
+            telemetryCheckBox = grayscaleTelemetryCheckBox;
             telemetryCheckBox.Text = "允许逐次确认的遥测/诊断摘要发送";
             telemetryCheckBox.AutoSize = true;
             telemetryCheckBox.Margin = new Padding(0, 10, 0, 4);
@@ -451,7 +653,14 @@ namespace TinyHwBar
             telemetryActions.Controls.Add(previewDiagnosticButton);
             advancedLayout.Controls.Add(telemetryActions, 1, 11);
 
-            telemetryStatusLabel = CreateStatusLabel("未发送任何遥测或诊断数据");
+            GrayscaleTextLabel grayscaleTelemetryStatusLabel =
+                new GrayscaleTextLabel();
+            grayscaleTelemetryStatusLabel.Text = "未发送任何遥测或诊断数据";
+            grayscaleTelemetryStatusLabel.AutoSize = true;
+            grayscaleTelemetryStatusLabel.Dock = DockStyle.Fill;
+            grayscaleTelemetryStatusLabel.ForeColor = Color.FromArgb(71, 85, 105);
+            grayscaleTelemetryStatusLabel.Margin = new Padding(0, 2, 0, 8);
+            telemetryStatusLabel = grayscaleTelemetryStatusLabel;
             advancedLayout.Controls.Add(telemetryStatusLabel, 1, 12);
 
             FlowLayoutPanel advancedActions = new FlowLayoutPanel();
@@ -474,10 +683,16 @@ namespace TinyHwBar
             tabs.TabPages.Add(settingsPage);
             tabs.TabPages.Add(advancedPage);
             Controls.Add(tabs);
+            grayscaleTelemetryCheckBox.EnableGrayscaleTextRendering();
+            grayscaleTelemetryStatusLabel.EnableGrayscaleTextRendering();
 
             AcceptButton = applyButton;
             CancelButton = closeButton;
+            RefreshGpuAdapterChoices(
+                settings.SelectedGpuAdapterId,
+                settings.SelectedGpuAdapterName);
             RefreshSettings(settings);
+            WireSettingsDirtyTracking();
         }
 
         internal event EventHandler<DashboardSettingsChangedEventArgs> SettingsApplied;
@@ -497,20 +712,95 @@ namespace TinyHwBar
                 return;
             }
 
-            int selectedIndex = Array.IndexOf(
-                AppSettings.SupportedOpacityPercentages,
-                settings.OpacityPercent);
-            opacityComboBox.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
-            lockedCheckBox.Checked = settings.Locked;
-            clickThroughCheckBox.Checked = settings.ClickThrough;
-            persistHistoryCheckBox.Checked = settings.PersistHistory;
-            gatewayLatencyCheckBox.Checked = settings.GatewayLatencyEnabled;
-            startupCheckBox.Checked = settings.StartupEnabled;
-            automaticUpdateCheckBox.Checked = settings.AutomaticUpdateEnabled;
-            updateEndpointTextBox.Text = settings.UpdateManifestUrl ?? string.Empty;
-            loopbackApiCheckBox.Checked = settings.LoopbackApiEnabled;
-            telemetryCheckBox.Checked = settings.TelemetryEnabled;
-            telemetryEndpointTextBox.Text = settings.TelemetryEndpoint ?? string.Empty;
+            bool wasSynchronizing = synchronizingSettings;
+            synchronizingSettings = true;
+            try
+            {
+                SetDisplayControls(settings);
+                persistHistoryCheckBox.Checked = settings.PersistHistory;
+                gatewayLatencyCheckBox.Checked = settings.GatewayLatencyEnabled;
+                SetGpuControls(settings);
+                startupCheckBox.Checked = settings.StartupEnabled;
+                automaticUpdateCheckBox.Checked = settings.AutomaticUpdateEnabled;
+                updateEndpointTextBox.Text = settings.UpdateManifestUrl ?? string.Empty;
+                loopbackApiCheckBox.Checked = settings.LoopbackApiEnabled;
+                telemetryCheckBox.Checked = settings.TelemetryEnabled;
+                telemetryEndpointTextBox.Text = settings.TelemetryEndpoint ?? string.Empty;
+                dirtyFields = DashboardDirtyFields.None;
+            }
+            finally
+            {
+                synchronizingSettings = wasSynchronizing;
+            }
+        }
+
+        internal void SyncSettings(AppSettings settings)
+        {
+            if (settings == null)
+            {
+                return;
+            }
+
+            bool wasSynchronizing = synchronizingSettings;
+            synchronizingSettings = true;
+            try
+            {
+                if (!IsDirty(DashboardDirtyFields.Opacity))
+                {
+                    SetOpacityControl(settings.OpacityPercent);
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Locked))
+                {
+                    lockedCheckBox.Checked = settings.Locked;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.ClickThrough))
+                {
+                    clickThroughCheckBox.Checked = settings.ClickThrough;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.History))
+                {
+                    persistHistoryCheckBox.Checked = settings.PersistHistory;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Gateway))
+                {
+                    gatewayLatencyCheckBox.Checked = settings.GatewayLatencyEnabled;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Gpu))
+                {
+                    SetGpuControls(settings);
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Startup))
+                {
+                    startupCheckBox.Checked = settings.StartupEnabled;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Update))
+                {
+                    automaticUpdateCheckBox.Checked = settings.AutomaticUpdateEnabled;
+                    updateEndpointTextBox.Text = settings.UpdateManifestUrl ?? string.Empty;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.LoopbackApi))
+                {
+                    loopbackApiCheckBox.Checked = settings.LoopbackApiEnabled;
+                }
+
+                if (!IsDirty(DashboardDirtyFields.Telemetry))
+                {
+                    telemetryCheckBox.Checked = settings.TelemetryEnabled;
+                    telemetryEndpointTextBox.Text = settings.TelemetryEndpoint ?? string.Empty;
+                }
+            }
+            finally
+            {
+                synchronizingSettings = wasSynchronizing;
+            }
         }
 
         internal void SetStartupStatus(string text)
@@ -520,7 +810,20 @@ namespace TinyHwBar
 
         internal void SetStartupState(bool enabled, string text)
         {
-            startupCheckBox.Checked = enabled;
+            if (!IsDirty(DashboardDirtyFields.Startup))
+            {
+                bool wasSynchronizing = synchronizingSettings;
+                synchronizingSettings = true;
+                try
+                {
+                    startupCheckBox.Checked = enabled;
+                }
+                finally
+                {
+                    synchronizingSettings = wasSynchronizing;
+                }
+            }
+
             SetStartupStatus(text);
         }
 
@@ -546,6 +849,8 @@ namespace TinyHwBar
                 return;
             }
 
+            latestSnapshot = snapshot;
+
             cpuValue.Text = FormatPercent(snapshot.CpuPercent);
             memoryValue.Text = FormatPercent(snapshot.MemoryPercent);
             discreteGpuValue.Text = FormatDiscreteGpuMetrics(snapshot);
@@ -561,6 +866,45 @@ namespace TinyHwBar
                 ? "--"
                 : snapshot.NetworkGatewayAddress;
             historyChart.SetPoints(history.Snapshot());
+            UpdateGpuSelectionStatus(null, EventArgs.Empty);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            ConstrainWindowToWorkingArea();
+        }
+
+        internal static Rectangle ConstrainToWorkingArea(
+            Rectangle bounds,
+            Rectangle workingArea,
+            int margin)
+        {
+            int safeMargin = Math.Max(0, margin);
+            int availableWidth = Math.Max(1, workingArea.Width - safeMargin * 2);
+            int availableHeight = Math.Max(1, workingArea.Height - safeMargin * 2);
+            int width = Math.Min(Math.Max(1, bounds.Width), availableWidth);
+            int height = Math.Min(Math.Max(1, bounds.Height), availableHeight);
+            int minimumLeft = workingArea.Left + safeMargin;
+            int minimumTop = workingArea.Top + safeMargin;
+            int maximumLeft = workingArea.Right - safeMargin - width;
+            int maximumTop = workingArea.Bottom - safeMargin - height;
+            int left = Math.Max(minimumLeft, Math.Min(bounds.Left, maximumLeft));
+            int top = Math.Max(minimumTop, Math.Min(bounds.Top, maximumTop));
+            return new Rectangle(left, top, width, height);
+        }
+
+        private void ConstrainWindowToWorkingArea()
+        {
+            Rectangle workingArea = Screen.FromControl(this).WorkingArea;
+            Rectangle constrained = ConstrainToWorkingArea(Bounds, workingArea, 12);
+            MinimumSize = new Size(
+                Math.Min(MinimumSize.Width, constrained.Width),
+                Math.Min(MinimumSize.Height, constrained.Height));
+            if (Bounds != constrained)
+            {
+                Bounds = constrained;
+            }
         }
 
         protected override void Dispose(bool disposing)
@@ -704,8 +1048,248 @@ namespace TinyHwBar
             return value;
         }
 
+        private void WireSettingsDirtyTracking()
+        {
+            opacityComboBox.SelectedIndexChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Opacity);
+            };
+            lockedCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Locked);
+            };
+            clickThroughCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.ClickThrough);
+            };
+            persistHistoryCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.History);
+            };
+            gatewayLatencyCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Gateway);
+            };
+            automaticGpuRadioButton.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Gpu);
+            };
+            manualGpuRadioButton.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Gpu);
+            };
+            gpuAdapterComboBox.SelectedIndexChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Gpu);
+            };
+            startupCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Startup);
+            };
+            automaticUpdateCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Update);
+            };
+            updateEndpointTextBox.TextChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Update);
+            };
+            loopbackApiCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.LoopbackApi);
+            };
+            telemetryCheckBox.CheckedChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Telemetry);
+            };
+            telemetryEndpointTextBox.TextChanged += delegate
+            {
+                MarkDirty(DashboardDirtyFields.Telemetry);
+            };
+        }
+
+        private void MarkDirty(DashboardDirtyFields field)
+        {
+            if (!synchronizingSettings)
+            {
+                dirtyFields |= field;
+            }
+        }
+
+        private bool IsDirty(DashboardDirtyFields field)
+        {
+            return (dirtyFields & field) != 0;
+        }
+
+        private void SetDisplayControls(AppSettings settings)
+        {
+            SetOpacityControl(settings.OpacityPercent);
+            lockedCheckBox.Checked = settings.Locked;
+            clickThroughCheckBox.Checked = settings.ClickThrough;
+        }
+
+        private void SetOpacityControl(int opacityPercent)
+        {
+            int selectedIndex = Array.IndexOf(
+                AppSettings.SupportedOpacityPercentages,
+                opacityPercent);
+            opacityComboBox.SelectedIndex = selectedIndex >= 0 ? selectedIndex : 0;
+        }
+
+        private void SetGpuControls(AppSettings settings)
+        {
+            automaticGpuRadioButton.Checked =
+                settings.GpuSelectionMode != GpuSelectionMode.Manual;
+            manualGpuRadioButton.Checked =
+                settings.GpuSelectionMode == GpuSelectionMode.Manual;
+            SelectGpuAdapter(
+                settings.SelectedGpuAdapterId,
+                settings.SelectedGpuAdapterName);
+            UpdateGpuSelectionControls(null, EventArgs.Empty);
+        }
+
+        private void RefreshGpuAdapters(object sender, EventArgs e)
+        {
+            GpuChoiceItem selected = gpuAdapterComboBox.SelectedItem as GpuChoiceItem;
+            RefreshGpuAdapterChoices(
+                selected == null ? string.Empty : selected.AdapterId,
+                selected == null ? string.Empty : selected.Name);
+            UpdateGpuSelectionControls(null, EventArgs.Empty);
+        }
+
+        private void RefreshGpuAdapterChoices(
+            string selectedAdapterId,
+            string selectedAdapterName)
+        {
+            gpuAdapterComboBox.BeginUpdate();
+            try
+            {
+                gpuAdapterComboBox.Items.Clear();
+                foreach (GpuAdapterChoice choice in GpuRoleSampler.GetAdapterChoices())
+                {
+                    gpuAdapterComboBox.Items.Add(new GpuChoiceItem(choice, true));
+                }
+
+                SelectGpuAdapter(selectedAdapterId, selectedAdapterName);
+            }
+            finally
+            {
+                gpuAdapterComboBox.EndUpdate();
+            }
+        }
+
+        private void SelectGpuAdapter(string adapterId, string adapterName)
+        {
+            if (!string.IsNullOrWhiteSpace(adapterId))
+            {
+                for (int index = 0; index < gpuAdapterComboBox.Items.Count; index++)
+                {
+                    GpuChoiceItem item = gpuAdapterComboBox.Items[index] as GpuChoiceItem;
+                    if (item != null && string.Equals(
+                            item.AdapterId,
+                            adapterId,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        gpuAdapterComboBox.SelectedIndex = index;
+                        return;
+                    }
+                }
+
+                int nameMatchIndex = -1;
+                int nameMatchCount = 0;
+                if (!string.IsNullOrWhiteSpace(adapterName))
+                {
+                    for (int index = 0; index < gpuAdapterComboBox.Items.Count; index++)
+                    {
+                        GpuChoiceItem item = gpuAdapterComboBox.Items[index] as GpuChoiceItem;
+                        if (item != null && item.IsAvailable && string.Equals(
+                                item.Name,
+                                adapterName.Trim(),
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            nameMatchIndex = index;
+                            nameMatchCount++;
+                        }
+                    }
+                }
+
+                if (nameMatchCount == 1)
+                {
+                    gpuAdapterComboBox.SelectedIndex = nameMatchIndex;
+                    return;
+                }
+
+                gpuAdapterComboBox.Items.Add(
+                    GpuChoiceItem.CreateUnavailable(adapterId, adapterName));
+                gpuAdapterComboBox.SelectedIndex = gpuAdapterComboBox.Items.Count - 1;
+                return;
+            }
+
+            if (gpuAdapterComboBox.Items.Count > 0)
+            {
+                gpuAdapterComboBox.SelectedIndex = 0;
+            }
+        }
+
+        private void UpdateGpuSelectionControls(object sender, EventArgs e)
+        {
+            gpuAdapterComboBox.Enabled = manualGpuRadioButton.Checked;
+            UpdateGpuSelectionStatus(null, EventArgs.Empty);
+        }
+
+        private void UpdateGpuSelectionStatus(object sender, EventArgs e)
+        {
+            if (automaticGpuRadioButton.Checked)
+            {
+                gpuSelectionStatusLabel.ForeColor = Color.FromArgb(30, 64, 175);
+                gpuSelectionStatusLabel.Text = latestSnapshot != null &&
+                    !string.IsNullOrWhiteSpace(latestSnapshot.EffectiveGpuAdapterName)
+                    ? "当前自动使用：" + latestSnapshot.EffectiveGpuAdapterName
+                    : "自动模式：正在检测最合适的 GPU";
+                return;
+            }
+
+            GpuChoiceItem selected = gpuAdapterComboBox.SelectedItem as GpuChoiceItem;
+            if (selected == null)
+            {
+                gpuSelectionStatusLabel.ForeColor = Color.FromArgb(185, 28, 28);
+                gpuSelectionStatusLabel.Text = "未检测到可手动选择的 GPU，请使用自动模式。";
+                return;
+            }
+
+            if (!selected.IsAvailable ||
+                (latestSnapshot != null &&
+                 latestSnapshot.GpuSelectionStatus ==
+                    GpuSelectionStatus.ManualUnavailableFallback &&
+                 string.Equals(
+                    latestSnapshot.RequestedGpuAdapterId,
+                    selected.AdapterId,
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                gpuSelectionStatusLabel.ForeColor = Color.FromArgb(185, 28, 28);
+                gpuSelectionStatusLabel.Text =
+                    "所选设备当前不可用；应用后将临时回退自动选择，设备恢复后自动重试。";
+                return;
+            }
+
+            gpuSelectionStatusLabel.ForeColor = Color.FromArgb(22, 101, 52);
+            gpuSelectionStatusLabel.Text = "手动选择：" + selected.Name;
+        }
+
         private void ClearHistory(object sender, EventArgs e)
         {
+            DialogResult confirmation = MessageBox.Show(
+                this,
+                "将清除当前会话中的历史曲线，并删除 TinyHwBar 自己的本地历史文件和备份。此操作无法撤销。\r\n\r\n是否继续？",
+                "确认清除历史",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirmation != DialogResult.Yes)
+            {
+                return;
+            }
+
             history.Clear();
             historyChart.SetPoints(history.Snapshot());
 
@@ -724,6 +1308,19 @@ namespace TinyHwBar
                 return;
             }
 
+            GpuSelectionMode gpuSelectionMode = manualGpuRadioButton.Checked
+                ? GpuSelectionMode.Manual
+                : GpuSelectionMode.Automatic;
+            GpuChoiceItem selectedGpu = gpuAdapterComboBox.SelectedItem as GpuChoiceItem;
+            if (gpuSelectionMode == GpuSelectionMode.Manual && selectedGpu == null)
+            {
+                gpuSelectionStatusLabel.ForeColor = Color.FromArgb(185, 28, 28);
+                gpuSelectionStatusLabel.Text =
+                    "没有可保存的手动设备；请选择自动模式或刷新设备列表。";
+                gpuAdapterComboBox.Focus();
+                return;
+            }
+
             EventHandler<DashboardSettingsChangedEventArgs> handler = SettingsApplied;
             if (handler != null)
             {
@@ -735,6 +1332,9 @@ namespace TinyHwBar
                         AppSettings.SupportedOpacityPercentages[selectedIndex],
                         persistHistoryCheckBox.Checked,
                         gatewayLatencyCheckBox.Checked,
+                        gpuSelectionMode,
+                        selectedGpu == null ? string.Empty : selectedGpu.AdapterId,
+                        selectedGpu == null ? string.Empty : selectedGpu.Name,
                         startupCheckBox.Checked,
                         automaticUpdateCheckBox.Checked,
                         updateEndpointTextBox.Text,
@@ -980,6 +1580,60 @@ namespace TinyHwBar
 
             string format = value >= 100.0 ? "0" : value >= 10.0 ? "0.0" : "0.00";
             return value.ToString(format, CultureInfo.CurrentCulture) + " " + units[unitIndex];
+        }
+
+        private sealed class GpuChoiceItem
+        {
+            private GpuChoiceItem(
+                string adapterId,
+                string name,
+                GpuAdapterRole role,
+                bool isAvailable)
+            {
+                AdapterId = adapterId ?? string.Empty;
+                Name = string.IsNullOrWhiteSpace(name) ? "未命名 GPU" : name.Trim();
+                Role = role;
+                IsAvailable = isAvailable;
+            }
+
+            internal GpuChoiceItem(GpuAdapterChoice choice, bool isAvailable)
+                : this(
+                    choice == null ? string.Empty : choice.AdapterId,
+                    choice == null ? string.Empty : choice.Name,
+                    choice == null ? GpuAdapterRole.Discrete : choice.Role,
+                    isAvailable)
+            {
+            }
+
+            internal string AdapterId { get; private set; }
+            internal string Name { get; private set; }
+            internal GpuAdapterRole Role { get; private set; }
+            internal bool IsAvailable { get; private set; }
+
+            internal static GpuChoiceItem CreateUnavailable(
+                string adapterId,
+                string adapterName)
+            {
+                return new GpuChoiceItem(
+                    adapterId,
+                    string.IsNullOrWhiteSpace(adapterName)
+                        ? "之前选择的 GPU"
+                        : adapterName,
+                    GpuAdapterRole.Discrete,
+                    false);
+            }
+
+            public override string ToString()
+            {
+                if (!IsAvailable)
+                {
+                    return Name + "（当前不可用）";
+                }
+
+                return Name + (Role == GpuAdapterRole.Discrete
+                    ? "（独立显卡）"
+                    : "（核显）");
+            }
         }
 
         private static Icon LoadApplicationIcon()

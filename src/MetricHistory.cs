@@ -70,7 +70,7 @@ namespace TinyHwBar
             }
 
             return new HistoryPoint(
-                DateTime.UtcNow,
+                snapshot.SampledAtUtc,
                 snapshot.CpuPercent,
                 snapshot.MemoryPercent,
                 snapshot.GpuPercent,
@@ -210,17 +210,32 @@ namespace TinyHwBar
         private void RemoveExpiredCore(DateTime nowUtc)
         {
             DateTime oldestAllowedUtc = nowUtc - MaximumAge;
-            while (count > 0)
+            int originalCount = count;
+            int retainedCount = 0;
+
+            for (int index = 0; index < originalCount; index++)
             {
-                HistoryPoint oldest = points[firstIndex];
-                if (oldest != null && oldest.TimestampUtc >= oldestAllowedUtc)
+                int sourceIndex = (firstIndex + index) % points.Length;
+                HistoryPoint point = points[sourceIndex];
+                if (point == null || point.TimestampUtc < oldestAllowedUtc)
                 {
-                    break;
+                    continue;
                 }
 
-                points[firstIndex] = null;
-                firstIndex = (firstIndex + 1) % points.Length;
-                count--;
+                int destinationIndex = (firstIndex + retainedCount) % points.Length;
+                points[destinationIndex] = point;
+                retainedCount++;
+            }
+
+            for (int index = retainedCount; index < originalCount; index++)
+            {
+                points[(firstIndex + index) % points.Length] = null;
+            }
+
+            count = retainedCount;
+            if (count == 0)
+            {
+                firstIndex = 0;
             }
         }
 

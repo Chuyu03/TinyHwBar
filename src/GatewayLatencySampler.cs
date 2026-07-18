@@ -104,6 +104,10 @@ namespace TinyHwBar
         IPAddress target,
         int timeoutMilliseconds);
 
+    internal delegate GatewayLatencyStatus GatewayTargetValidator(
+        NetworkMetrics networkMetrics,
+        out IPAddress target);
+
     internal sealed class GatewayLatencySampler : IDisposable
     {
         private const int DefaultTimeoutMilliseconds = 750;
@@ -112,6 +116,7 @@ namespace TinyHwBar
 
         private readonly object synchronization = new object();
         private readonly GatewayEchoSender echoSender;
+        private readonly GatewayTargetValidator targetValidator;
         private readonly TimeSpan probeInterval;
         private readonly int timeoutMilliseconds;
 
@@ -119,7 +124,10 @@ namespace TinyHwBar
         private bool enabled;
         private long generation;
         private string activeTargetKey = string.Empty;
-        private DateTime nextProbeUtc = DateTime.MinValue;
+        // This is a sampler-wide send gate, not target-specific state. Keeping it
+        // across route/target resets preserves the documented global probe limit
+        // even while Windows is rapidly changing interfaces or gateways.
+        private DateTime nextAllowedProbeUtc = DateTime.MinValue;
         private Task<GatewayEchoResult> activeProbe;
         private GatewayLatencyMetrics cachedMetrics = CreateDisabledMetrics();
 
@@ -135,6 +143,19 @@ namespace TinyHwBar
             GatewayEchoSender echoSender,
             TimeSpan probeInterval,
             int timeoutMilliseconds)
+            : this(
+                echoSender,
+                probeInterval,
+                timeoutMilliseconds,
+                ValidateGatewayTarget)
+        {
+        }
+
+        internal GatewayLatencySampler(
+            GatewayEchoSender echoSender,
+            TimeSpan probeInterval,
+            int timeoutMilliseconds,
+            GatewayTargetValidator targetValidator)
         {
             if (echoSender == null)
             {
@@ -155,7 +176,13 @@ namespace TinyHwBar
                     "Gateway probe timeout must be between 100 and 2000 ms.");
             }
 
+            if (targetValidator == null)
+            {
+                throw new ArgumentNullException("targetValidator");
+            }
+
             this.echoSender = echoSender;
+            this.targetValidator = targetValidator;
             this.probeInterval = probeInterval;
             this.timeoutMilliseconds = timeoutMilliseconds;
         }
@@ -221,7 +248,7 @@ namespace TinyHwBar
                 }
 
                 IPAddress target;
-                GatewayLatencyStatus validationStatus = ValidateGatewayTarget(
+                GatewayLatencyStatus validationStatus = targetValidator(
                     networkMetrics,
                     out target);
                 if (validationStatus != GatewayLatencyStatus.Available)
@@ -277,7 +304,7 @@ namespace TinyHwBar
                         GatewayLatencyStatus.Probing);
                 }
 
-                if (DateTime.UtcNow < nextProbeUtc)
+                if (DateTime.UtcNow < nextAllowedProbeUtc)
                 {
                     return cachedMetrics.Copy();
                 }
@@ -331,7 +358,7 @@ namespace TinyHwBar
             string gatewayAddress)
         {
             long probeGeneration = ++generation;
-            nextProbeUtc = DateTime.UtcNow.Add(probeInterval);
+            nextAllowedProbeUtc = DateTime.UtcNow.Add(probeInterval);
 
             Task<GatewayEchoResult> probe;
             try
@@ -424,7 +451,6 @@ namespace TinyHwBar
             generation++;
             activeProbe = null;
             activeTargetKey = string.Empty;
-            nextProbeUtc = DateTime.MinValue;
         }
 
         private static GatewayLatencyStatus ValidateGatewayTarget(

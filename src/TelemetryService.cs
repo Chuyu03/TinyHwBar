@@ -163,6 +163,8 @@ namespace TinyHwBar
 
     internal sealed class HttpWebRequestTelemetryTransport : ITelemetryTransport
     {
+        internal const string UserAgentValue = "TinyHwBar/3 telemetry";
+
         private readonly IEndpointAddressResolver addressResolver;
 
         internal HttpWebRequestTelemetryTransport()
@@ -207,7 +209,7 @@ namespace TinyHwBar
             request.UseDefaultCredentials = false;
             request.Credentials = null;
             request.PreAuthenticate = false;
-            request.UserAgent = "TinyHwBar/2 telemetry";
+            request.UserAgent = UserAgentValue;
 
             using (Stream requestStream = request.GetRequestStream())
             {

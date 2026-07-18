@@ -184,6 +184,8 @@ namespace TinyHwBar
 
     internal sealed class HttpWebRequestUpdateTransport : IUpdateTransport
     {
+        internal const string UserAgentValue = "TinyHwBar/3 update-check";
+
         private readonly IEndpointAddressResolver addressResolver;
 
         internal HttpWebRequestUpdateTransport()
@@ -220,7 +222,7 @@ namespace TinyHwBar
             request.UseDefaultCredentials = false;
             request.Credentials = null;
             request.PreAuthenticate = false;
-            request.UserAgent = "TinyHwBar/2 update-check";
+            request.UserAgent = UserAgentValue;
 
             HttpWebResponse response = null;
             try
