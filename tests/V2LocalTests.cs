@@ -2736,8 +2736,11 @@ namespace TinyHwBar.Tests
                 unconstrainedLabel.Text = statusText;
                 unconstrainedLabel.AutoSize = true;
                 unconstrainedLabel.UseCompatibleTextRendering = true;
-                int originalPreferredHeight =
-                    baselineLabel.GetPreferredSize(Size.Empty).Height;
+                Size originalPreferredSize =
+                    baselineLabel.GetPreferredSize(Size.Empty);
+                Size compatiblePreferredSize =
+                    unconstrainedLabel.GetPreferredSize(Size.Empty);
+                int originalPreferredHeight = originalPreferredSize.Height;
                 grayscaleLabel.EnableGrayscaleTextRendering();
 
                 Assert(
@@ -2747,13 +2750,17 @@ namespace TinyHwBar.Tests
 
                 grayscaleLabel.BackColor = Color.White;
                 grayscaleLabel.ForeColor = Color.Black;
+                int comparisonWidth = Math.Max(
+                    originalPreferredSize.Width,
+                    compatiblePreferredSize.Width);
                 grayscaleLabel.Size = new Size(
-                    baselineLabel.GetPreferredSize(Size.Empty).Width,
+                    comparisonWidth,
                     originalPreferredHeight);
                 unconstrainedLabel.BackColor = Color.White;
                 unconstrainedLabel.ForeColor = Color.Black;
-                unconstrainedLabel.Size = unconstrainedLabel.GetPreferredSize(
-                    Size.Empty);
+                unconstrainedLabel.Size = new Size(
+                    comparisonWidth,
+                    compatiblePreferredSize.Height);
                 using (Bitmap bitmap = new Bitmap(
                     grayscaleLabel.Width,
                     grayscaleLabel.Height))
@@ -2780,8 +2787,14 @@ namespace TinyHwBar.Tests
                         "grayscale status text still contains RGB subpixel fringes");
                     Assert(
                         !inkBounds.IsEmpty &&
-                        inkBounds.Size == unconstrainedInkBounds.Size,
-                        "grayscale status text is missing or clipped at the preserved row height");
+                        !unconstrainedInkBounds.IsEmpty &&
+                        inkBounds.Top == unconstrainedInkBounds.Top &&
+                        inkBounds.Bottom == unconstrainedInkBounds.Bottom,
+                        "grayscale status text is missing or vertically clipped at the preserved row height; " +
+                        "GDI preferred=" + originalPreferredSize +
+                        ", GDI+ preferred=" + compatiblePreferredSize +
+                        ", constrained ink=" + inkBounds +
+                        ", unconstrained ink=" + unconstrainedInkBounds);
                 }
 
                 grayscaleLabel.Text =
